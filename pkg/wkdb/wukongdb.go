@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
@@ -27,6 +28,7 @@ type wukongDB struct {
 	recoveryChannelLocks [64]sync.RWMutex
 	subscriberRecoveryMu sync.Mutex
 	recoveryUserLocks    [64]sync.Mutex
+	recoveryActive       atomic.Bool
 	dbs                  []*pebble.DB
 	wkdbs                []*BatchDB
 	shardNum             uint32 // 分区数量，这个一但设置就不能修改
@@ -97,6 +99,7 @@ func NewWukongDB(opts *Options) DB {
 		Log:    wklog.NewWKLog("wukongDB"),
 		dblock: newDBLock(),
 	}
+	wk.recoveryActive.Store(opts.SubscriberRecoveryEnabled)
 
 	// 创建缓存管理器
 	wk.cacheManager = NewCacheManager(
@@ -158,6 +161,9 @@ func (wk *wukongDB) Open() error {
 		wkdb := NewBatchDB(i, db)
 		wkdb.Start()
 		wk.wkdbs = append(wk.wkdbs, wkdb)
+	}
+	if err := wk.loadSubscriberRecoveryActive(); err != nil {
+		return err
 	}
 
 	go wk.collectMetricsLoop()

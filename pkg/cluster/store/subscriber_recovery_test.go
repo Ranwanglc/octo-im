@@ -14,6 +14,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
+	wkproto "github.com/WuKongIM/WuKongIMGoProto"
 	"github.com/stretchr/testify/require"
 )
 
@@ -84,6 +85,50 @@ func recoveryStore(t *testing.T) (*Store, *recoverySlots) {
 
 func recoveryConfig() SubscriberRecoveryConfig {
 	return SubscriberRecoveryConfig{Workers: 2, MaxPending: 128, Interval: 10 * time.Millisecond, Timeout: time.Second}
+}
+
+func TestLegacySubscriberMutationsRejectedWhenRecoveryEnabled(t *testing.T) {
+	s := New(NewOptions(WithSubscriberRecoveryEnabled(true)))
+	members := []wkdb.Member{{Uid: "a"}}
+	for _, err := range []error{
+		s.AddSubscribers("g", 2, members),
+		s.RemoveSubscribers("g", 2, []string{"a"}),
+		s.RemoveAllSubscriber("g", 2),
+		s.AddDenylist("g", 2, members),
+		s.RemoveDenylist("g", 2, []string{"a"}),
+		s.RemoveAllDenylist("g", 2),
+	} {
+		require.ErrorIs(t, err, ErrLegacySubscriberMutationDisabled)
+	}
+	require.NoError(t, s.rejectLegacySubscriberMutation(wkproto.ChannelTypePerson))
+}
+
+func TestLegacySubscriberMutationsRejectedAfterRecoveryStateReopen(t *testing.T) {
+	dir := t.TempDir()
+	openDB := func() wkdb.DB {
+		db := wkdb.NewWukongDB(wkdb.NewOptions(
+			wkdb.WithDir(dir),
+			wkdb.WithNodeId(1),
+			wkdb.WithShardNum(1),
+			wkdb.WithMemTableSize(1<<20),
+		))
+		require.NoError(t, db.Open())
+		return db
+	}
+
+	db := openDB()
+	effect := wkdb.ConversationEffect{
+		UID: "a", ChannelID: "g", ChannelType: wkproto.ChannelTypeGroup,
+		Version: 1, ConversationID: 7, CreatedAt: time.Now().UnixNano(),
+	}
+	require.NoError(t, db.(wkdb.SubscriberRecoveryDB).ApplyConversationEffects([]wkdb.ConversationEffect{effect}))
+	require.NoError(t, db.Close())
+
+	db = openDB()
+	defer db.Close()
+	require.True(t, db.SubscriberRecoveryActive())
+	s := New(NewOptions(WithDB(db)))
+	require.ErrorIs(t, s.AddSubscribers("g", wkproto.ChannelTypeGroup, []wkdb.Member{{Uid: "a"}}), ErrLegacySubscriberMutationDisabled)
 }
 
 func TestSubscriberRecoveryWorkerDrainAfterTimeout(t *testing.T) {

@@ -101,6 +101,7 @@ func New(opts *Options) *Server {
 			wkdb.WithNodeId(opts.ConfigOptions.NodeId),
 			wkdb.WithMemTableSize(opts.DB.WKDbMemTableSize),
 			wkdb.WithSlotCount(int(opts.ConfigOptions.SlotCount)),
+			wkdb.WithSubscriberRecoveryEnabled(opts.SubscriberRecoveryEnabled),
 		),
 	)
 
@@ -154,6 +155,7 @@ func New(opts *Options) *Server {
 		store.WithChannel(s.channelServer),
 		store.WithDB(s.db),
 		store.WithIsCmdChannel(opts.IsCmdChannel),
+		store.WithSubscriberRecoveryEnabled(opts.SubscriberRecoveryEnabled),
 	))
 
 	// 添加事件监听
@@ -293,7 +295,7 @@ func (s *Server) OnConfigChange(cfg *types.Config) {
 func (s *Server) slotApplyLogs(slotId uint32, logs []rafttype.Log) error {
 	err := s.store.ApplySlotLogs(slotId, logs)
 	if err != nil {
-		s.Panic("apply slot logs failed", zap.Uint32("slotId", slotId), zap.Error(err))
+		s.Error("apply slot logs failed", zap.Uint32("slotId", slotId), zap.Error(err))
 		return err
 	}
 	return nil

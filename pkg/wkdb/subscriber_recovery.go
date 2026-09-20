@@ -258,6 +258,7 @@ func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o Subs
 	if version == 0 {
 		return errors.New("zero subscriber operation version")
 	}
+	wk.recoveryActive.Store(true)
 	wk.subscriberRecoveryMu.Lock()
 	defer wk.subscriberRecoveryMu.Unlock()
 	channelLock := &wk.recoveryChannelLocks[key.ChannelToNum(o.ChannelID, o.ChannelType)%64]

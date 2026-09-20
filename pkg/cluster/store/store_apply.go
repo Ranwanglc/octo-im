@@ -470,17 +470,19 @@ func (s *Store) handleBatchUpdateConversation(cmd *CMD) error {
 			conversationType = wkdb.ConversationTypeCMD
 		}
 		for uid, seq := range model.Uids {
-			lifecycle, managed, err := s.wdb.ConversationLifecycle(uid, model.ChannelId, model.ChannelType)
-			if err != nil {
-				return err
-			}
-			if managed {
-				if !lifecycle.Deleted {
-					if err := s.wdb.UpdateConversationIfSeqGreater(uid, model.ChannelId, model.ChannelType, seq); err != nil {
-						return err
-					}
+			if s.wdb.SubscriberRecoveryActive() {
+				lifecycle, managed, err := s.wdb.ConversationLifecycle(uid, model.ChannelId, model.ChannelType)
+				if err != nil {
+					return err
 				}
-				continue
+				if managed {
+					if !lifecycle.Deleted {
+						if err := s.wdb.UpdateConversationIfSeqGreater(uid, model.ChannelId, model.ChannelType, seq); err != nil {
+							return err
+						}
+					}
+					continue
+				}
 			}
 			conversation := wkdb.Conversation{
 				Uid:          uid,

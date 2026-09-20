@@ -1,9 +1,10 @@
-# Subscriber backlog recovery (dependent on PR #50)
+# Subscriber backlog recovery
 
 This change addresses frequent group/subzone subscriber mutations that previously
 waited for all user conversation writes, or submitted cleanup without a durable
-continuation. It is based on PR #50 at `93c6331a`. It does not include PR #51 or
-claim to repair all Raft election, message delivery, or storage failures.
+continuation. Its prerequisite work from PR #50 is already present in the base.
+It does not include PR #51 or claim to repair all Raft election, message
+delivery, or storage failures.
 
 ## Enablement and API contract
 
@@ -22,8 +23,12 @@ subscriberRecovery:
 ```
 
 Keep the feature enabled after accepting managed operations. Disabling workers
-stops recovery; sending new legacy mutations into managed memberships bypasses
-source intent generation. Downgrading a populated cluster is not supported by
+stops recovery, but persisted recovery records keep lifecycle fencing active
+after restart. Legacy subscriber and denylist mutations for non-personal
+channels are rejected once recovery is enabled or recovery state exists, so they
+cannot bypass source intent generation. The `oldV1Api` migration/import task is
+incompatible with recovery and startup rejects enabling both. Finish migration
+before enabling recovery. Downgrading a populated cluster is not supported by
 this PR. This is a coordinated rollout, not a mixed-version feature switch.
 
 With the feature enabled, the following non-personal channel endpoints use the
@@ -95,6 +100,9 @@ Old cleanup cannot remove a newer join and old add work cannot resurrect a later
 departure. Normal conversation writes are fenced before legacy ID rewriting.
 The first managed operation cleans duplicate rows from the old implementation;
 adopting an existing member preserves its conversation read/unread state.
+Clusters with recovery disabled and no persisted recovery records bypass the
+lifecycle locks and point reads entirely. On reopen, a bounded namespace probe
+detects existing recovery records before serving writes and restores fencing.
 
 Conversation data and lifecycle commit atomically in the user DB. The reverse
 channel/user relation is in another physical DB. Its `RelationDone` continuation
@@ -132,9 +140,10 @@ The first migration cleanup can still scan a user's existing conversation rows;
 large historical tables take time. Bounded scheduling does not guarantee a fixed
 recovery time. Under sustained arrival faster than drain, partitions reach their
 admission limit. Disk repair, available target leaders, and a functioning Raft
-quorum remain prerequisites for recovery. Non-API code that directly mutates
-subscribers must use `SubmitSubscriberOperation` to obtain these guarantees;
-legacy migration/import entry points are not retroactively repaired.
+quorum remain prerequisites for recovery. Non-API code that mutates managed
+subscribers must use `SubmitSubscriberOperation`; legacy Store mutation methods
+fail while recovery is active. Existing personal-channel denylist behavior is
+outside subscriber recovery and remains on the legacy path.
 
 ## Observe recovery
 

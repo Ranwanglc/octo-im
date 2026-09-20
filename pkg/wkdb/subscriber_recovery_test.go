@@ -17,6 +17,31 @@ func recoveryTestDB(t *testing.T, dir string) *wukongDB {
 	return db
 }
 
+func TestSubscriberRecoveryInactiveSkipsLifecycleReads(t *testing.T) {
+	db := NewWukongDB(NewOptions(WithShardNum(1))).(*wukongDB)
+	input := []Conversation{{Uid: "a", ChannelId: "g", ChannelType: 2, Id: 1}}
+	filtered, err := db.filterRecoveryConversations(input)
+	require.NoError(t, err)
+	require.Equal(t, input, filtered)
+}
+
+func TestSubscriberRecoveryActivationSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	db := recoveryTestDB(t, dir)
+	require.False(t, db.SubscriberRecoveryActive())
+	effect := ConversationEffect{UID: "a", ChannelID: "g", ChannelType: 2, Version: 1, ConversationID: 7, CreatedAt: time.Now().UnixNano()}
+	require.NoError(t, db.ApplyConversationEffects([]ConversationEffect{effect}))
+	require.True(t, db.SubscriberRecoveryActive())
+	require.NoError(t, db.Close())
+
+	db = recoveryTestDB(t, dir)
+	defer db.Close()
+	require.True(t, db.SubscriberRecoveryActive())
+	filtered, err := db.filterRecoveryConversations([]Conversation{{Uid: "a", ChannelId: "g", ChannelType: 2, Id: 8}})
+	require.NoError(t, err)
+	require.Empty(t, filtered)
+}
+
 func recoveryOperation(id, mode string, uids ...string) SubscriberOperation {
 	ids := make([]uint64, len(uids))
 	for i := range ids {

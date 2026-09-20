@@ -54,6 +54,7 @@ func (s *Store) StartSubscriberRecovery(cfg SubscriberRecoveryConfig, finalize f
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &subscriberRecovery{config: cfg, finalize: finalize, cancel: cancel, stats: SubscriberRecoveryStats{Workers: cfg.Workers}}
 	s.recovery = r
+	s.recoveryEnabled.Store(true)
 	for i := 0; i < cfg.Workers; i++ {
 		r.wg.Add(1)
 		go func(worker int) { defer r.wg.Done(); s.runSubscriberRecovery(ctx, worker) }(i)

@@ -1,6 +1,6 @@
 # Validation on 2026-09-18
 
-Base: PR #50, `93c6331ad2a60af26902ff541bb12d2e010296a3`.
+Base: `v2.2.5-20260422-fix1` at `44034be2` (merged PR #50).
 The tested binary SHA-256 and unrounded observations are in
 [smoke-20260918.json](smoke-20260918.json).
 
@@ -74,8 +74,20 @@ failure is recorded rather than counted as a clean full-suite pass. The changed
 Store and Raft packages passed their complete package suites, and all new recovery
 tests passed. Unrelated baseline failures are not fixed in this PR.
 
-Local raw logs and node data are retained in
-`/home/mlamp/Documents/workspace-cli-codex/subscriber-recovery-validation-20260918/`
-(`final-smoke/`, `go-test-final-all.log`, `go-test-baseline.log`, and focused test
-logs). Run commands and the harness are committed so the checks can be repeated
-without access to that local directory.
+The local raw logs and node data are not part of the repository. The run
+commands and harness are committed so the checks can be repeated independently.
+
+## P1 blocker follow-up on 2026-09-20
+
+After wiring non-panicking Apply errors, inactive lifecycle fast paths, persisted
+fencing detection, and legacy-mutation rejection, all focused tests passed with
+the race detector and the repository built successfully. A fresh three-node
+smoke run passed all five scenarios. Its create, leave/rejoin, restart, and
+remove-all drains completed in 3.221 s, 3.201 s, 4.116 s, and 2.051 s,
+respectively; peak cgroup memory was 127,295,488 bytes with no OOM event.
+
+A separate three-node source-slot failover run submitted 256 members, killed the
+source leader while all 256 effects were pending, elected a new leader in
+6.815 s, and completed recovery in 75.197 s. All 256 conversations were present,
+the killed node rejoined and observed the new leader, peak memory was 138,551,296
+bytes, and no OOM event occurred.

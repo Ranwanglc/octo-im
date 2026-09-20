@@ -5,11 +5,47 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
+	"github.com/cockroachdb/pebble"
 )
+
+func (wk *wukongDB) SubscriberRecoveryActive() bool {
+	return wk.recoveryActive.Load()
+}
+
+// loadSubscriberRecoveryActive preserves lifecycle fencing after a restart,
+// even if workers were accidentally disabled after recovery state was created.
+// Clusters that have never enabled recovery avoid per-conversation point reads.
+func (wk *wukongDB) loadSubscriberRecoveryActive() error {
+	if wk.SubscriberRecoveryActive() {
+		return nil
+	}
+	lower := recoveryKey(recoveryReceipt)
+	upper := recoveryKey(recoveryApplied + 1)
+	for _, db := range wk.dbs {
+		iter := db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+		found := iter.First()
+		err := iter.Error()
+		closeErr := iter.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if found {
+			wk.recoveryActive.Store(true)
+			return nil
+		}
+	}
+	return nil
+}
 
 // lockRecoveryUsers uses a fixed number of locks, acquired in the same order.
 // Generic conversation writers and lifecycle application share these locks.
 func (wk *wukongDB) lockRecoveryUsers(uids []string) func() {
+	if !wk.SubscriberRecoveryActive() {
+		return func() {}
+	}
 	var used [64]bool
 	for _, uid := range uids {
 		used[key.HashWithString(uid)%64] = true
@@ -46,6 +82,9 @@ func (wk *wukongDB) ConversationLifecycle(uid, ch string, tp uint8) (Conversatio
 // ID. A stale cache flush cannot resurrect a departed membership or overwrite a
 // new join's read position. Unmanaged conversations retain their old behavior.
 func (wk *wukongDB) filterRecoveryConversations(cs []Conversation) ([]Conversation, error) {
+	if !wk.SubscriberRecoveryActive() {
+		return cs, nil
+	}
 	filtered := make([]Conversation, 0, len(cs))
 	for _, c := range cs {
 		if c.Uid == "" {
@@ -78,6 +117,7 @@ func (wk *wukongDB) ApplyConversationEffects(effects []ConversationEffect) error
 			return errors.New("invalid conversation effect")
 		}
 	}
+	wk.recoveryActive.Store(true)
 	for _, e := range effects {
 		if err := wk.applyConversationEffect(e); err != nil {
 			return err
