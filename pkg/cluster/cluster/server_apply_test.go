@@ -12,6 +12,7 @@ import (
 func TestSlotApplyLogsReturnsErrorWithoutPanicking(t *testing.T) {
 	s := &Server{
 		store: store.New(store.NewOptions()),
+		opts:  NewOptions(WithSubscriberRecoveryEnabled(true)),
 		Log:   wklog.NewWKLog("cluster-test"),
 	}
 	var applyErr error
@@ -19,4 +20,15 @@ func TestSlotApplyLogsReturnsErrorWithoutPanicking(t *testing.T) {
 		applyErr = s.slotApplyLogs(1, []rafttype.Log{{Index: 1, Data: []byte{0}}})
 	})
 	require.Error(t, applyErr)
+}
+
+func TestSlotApplyLogsPreservesFailFastWhenRecoveryDisabled(t *testing.T) {
+	s := &Server{
+		store: store.New(store.NewOptions()),
+		opts:  NewOptions(),
+		Log:   wklog.NewWKLog("cluster-test"),
+	}
+	require.Panics(t, func() {
+		_ = s.slotApplyLogs(1, []rafttype.Log{{Index: 1, Data: []byte{0}}})
+	})
 }

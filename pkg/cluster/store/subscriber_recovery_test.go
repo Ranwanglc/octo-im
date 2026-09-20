@@ -103,29 +103,20 @@ func TestLegacySubscriberMutationsRejectedWhenRecoveryEnabled(t *testing.T) {
 	require.NoError(t, s.rejectLegacySubscriberMutation(wkproto.ChannelTypePerson))
 }
 
-func TestLegacySubscriberMutationsRejectedAfterRecoveryStateReopen(t *testing.T) {
-	dir := t.TempDir()
-	openDB := func() wkdb.DB {
-		db := wkdb.NewWukongDB(wkdb.NewOptions(
-			wkdb.WithDir(dir),
-			wkdb.WithNodeId(1),
-			wkdb.WithShardNum(1),
-			wkdb.WithMemTableSize(1<<20),
-		))
-		require.NoError(t, db.Open())
-		return db
-	}
-
-	db := openDB()
+func TestLegacySubscriberMutationsRejectedAfterRecoveryActivation(t *testing.T) {
+	db := wkdb.NewWukongDB(wkdb.NewOptions(
+		wkdb.WithDir(t.TempDir()),
+		wkdb.WithNodeId(1),
+		wkdb.WithShardNum(1),
+		wkdb.WithMemTableSize(1<<20),
+	))
+	require.NoError(t, db.Open())
+	defer db.Close()
 	effect := wkdb.ConversationEffect{
 		UID: "a", ChannelID: "g", ChannelType: wkproto.ChannelTypeGroup,
 		Version: 1, ConversationID: 7, CreatedAt: time.Now().UnixNano(),
 	}
 	require.NoError(t, db.(wkdb.SubscriberRecoveryDB).ApplyConversationEffects([]wkdb.ConversationEffect{effect}))
-	require.NoError(t, db.Close())
-
-	db = openDB()
-	defer db.Close()
 	require.True(t, db.SubscriberRecoveryActive())
 	s := New(NewOptions(WithDB(db)))
 	require.ErrorIs(t, s.AddSubscribers("g", wkproto.ChannelTypeGroup, []wkdb.Member{{Uid: "a"}}), ErrLegacySubscriberMutationDisabled)

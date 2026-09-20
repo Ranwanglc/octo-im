@@ -17,6 +17,13 @@ func recoveryTestDB(t *testing.T, dir string) *wukongDB {
 	return db
 }
 
+func reopenRecoveryTestDB(t *testing.T, dir string) *wukongDB {
+	t.Helper()
+	db := NewWukongDB(NewOptions(WithDir(dir), WithNodeId(1), WithShardNum(2), WithMemTableSize(1<<20), WithSubscriberRecoveryEnabled(true))).(*wukongDB)
+	require.NoError(t, db.Open())
+	return db
+}
+
 func TestSubscriberRecoveryInactiveSkipsLifecycleReads(t *testing.T) {
 	db := NewWukongDB(NewOptions(WithShardNum(1))).(*wukongDB)
 	input := []Conversation{{Uid: "a", ChannelId: "g", ChannelType: 2, Id: 1}}
@@ -34,7 +41,10 @@ func TestSubscriberRecoveryActivationSurvivesReopen(t *testing.T) {
 	require.True(t, db.SubscriberRecoveryActive())
 	require.NoError(t, db.Close())
 
-	db = recoveryTestDB(t, dir)
+	disabled := NewWukongDB(NewOptions(WithDir(dir), WithNodeId(1), WithShardNum(2), WithMemTableSize(1<<20))).(*wukongDB)
+	require.ErrorIs(t, disabled.Open(), ErrSubscriberRecoveryMustRemainEnabled)
+
+	db = reopenRecoveryTestDB(t, dir)
 	defer db.Close()
 	require.True(t, db.SubscriberRecoveryActive())
 	filtered, err := db.filterRecoveryConversations([]Conversation{{Uid: "a", ChannelId: "g", ChannelType: 2, Id: 8}})
@@ -139,7 +149,7 @@ func TestSubscriberRecoveryRestartCheckpointAndReset(t *testing.T) {
 	cp.Error = "target unavailable"
 	require.NoError(t, db.CheckpointSubscriberWork(cp))
 	require.NoError(t, db.Close())
-	db = recoveryTestDB(t, dir)
+	db = reopenRecoveryTestDB(t, dir)
 	defer db.Close()
 	w = recoveryWork(t, db, reset)
 	require.Equal(t, 1, w.Next)
@@ -220,7 +230,7 @@ func TestConversationLifecycleRepairsInterruptedRelation(t *testing.T) {
 	require.NoError(t, b.Close())
 	require.NoError(t, db.deleteConversationLocalUserRelation("group", 2, "a"))
 	require.NoError(t, db.Close())
-	db = recoveryTestDB(t, dir)
+	db = reopenRecoveryTestDB(t, dir)
 	defer db.Close()
 	require.NoError(t, db.ApplyConversationEffects([]ConversationEffect{e}))
 	users, err := db.GetChannelConversationLocalUsers("group", 2)

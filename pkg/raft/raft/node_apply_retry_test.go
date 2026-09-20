@@ -8,7 +8,7 @@ import (
 )
 
 func TestApplyRetryIsTickPacedAndRecoversAfterCircuitOpens(t *testing.T) {
-	n := NewNode(1, types.RaftState{LastLogIndex: 1, LastTerm: 1}, NewOptions(WithNodeId(1), WithReplicas([]uint64{1})))
+	n := NewNode(1, types.RaftState{LastLogIndex: 1, LastTerm: 1}, NewOptions(WithNodeId(1), WithReplicas([]uint64{1}), WithApplyErrorRetry(true)))
 	n.queue.committedIndex = 1
 	attempts := 0
 	for tick := 0; tick <= 640; tick++ {
@@ -62,7 +62,7 @@ func TestApplyRetryIsTickPacedAndRecoversAfterCircuitOpens(t *testing.T) {
 }
 
 func TestApplyBackoffDoesNotDelayHeartbeat(t *testing.T) {
-	n := NewNode(1, types.RaftState{LastLogIndex: 1, LastTerm: 1}, NewOptions(WithNodeId(1), WithReplicas([]uint64{1, 2}), WithElectionOn(true)))
+	n := NewNode(1, types.RaftState{LastLogIndex: 1, LastTerm: 1}, NewOptions(WithNodeId(1), WithReplicas([]uint64{1, 2}), WithElectionOn(true), WithApplyErrorRetry(true)))
 	n.BecomeLeader(1)
 	n.queue.committedIndex = 1
 	n.Ready()
@@ -78,4 +78,14 @@ func TestApplyBackoffDoesNotDelayHeartbeat(t *testing.T) {
 		ping = ping || e.Type == types.Ping
 	}
 	require.True(t, ping, "the raft loop must serve heartbeats during storage cooldown")
+}
+
+func TestApplyErrorRetryIsDisabledByDefault(t *testing.T) {
+	n := NewNode(1, types.RaftState{LastLogIndex: 1, LastTerm: 1}, NewOptions(WithNodeId(1), WithReplicas([]uint64{1})))
+	n.queue.committedIndex = 1
+	require.Len(t, n.Ready(), 1)
+	require.NoError(t, n.Step(types.Event{Type: types.ApplyResp, Reason: types.ReasonError}))
+	require.Zero(t, n.applyRetryTicks)
+	require.Zero(t, n.applyFailures)
+	require.True(t, n.HasReady(), "default behavior retries immediately")
 }

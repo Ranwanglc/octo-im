@@ -154,16 +154,23 @@ func (wk *wukongDB) Open() error {
 
 		db, err := pebble.Open(filepath.Join(wk.opts.DataDir, "wukongimdb", fmt.Sprintf("shard%03d", i)), opts)
 		if err != nil {
+			wk.closeOpenedShards()
 			return err
 		}
 		wk.dbs = append(wk.dbs, db)
-
+	}
+	if err := wk.loadSubscriberRecoveryActive(); err != nil {
+		wk.closeOpenedShards()
+		return err
+	}
+	if wk.SubscriberRecoveryActive() && !wk.opts.SubscriberRecoveryEnabled {
+		wk.closeOpenedShards()
+		return ErrSubscriberRecoveryMustRemainEnabled
+	}
+	for i, db := range wk.dbs {
 		wkdb := NewBatchDB(i, db)
 		wkdb.Start()
 		wk.wkdbs = append(wk.wkdbs, wkdb)
-	}
-	if err := wk.loadSubscriberRecoveryActive(); err != nil {
-		return err
 	}
 
 	go wk.collectMetricsLoop()
@@ -172,6 +179,16 @@ func (wk *wukongDB) Open() error {
 	wk.cacheManager.Start()
 
 	return nil
+}
+
+func (wk *wukongDB) closeOpenedShards() {
+	for _, db := range wk.dbs {
+		if err := db.Close(); err != nil {
+			wk.Error("close db after open failure", zap.Error(err))
+		}
+	}
+	wk.dbs = nil
+	wk.dblock.stop()
 }
 
 func (wk *wukongDB) Close() error {

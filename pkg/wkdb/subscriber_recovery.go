@@ -31,6 +31,8 @@ const (
 	recoveryApplied         byte = 6
 )
 
+var ErrSubscriberRecoveryMustRemainEnabled = errors.New("subscriber recovery state exists; subscriberRecovery.enabled must remain true")
+
 // SubscriberOperation is an immutable request. IDs and timestamps are selected
 // before replication; retries reuse OperationID, not a newly generated intent.
 type SubscriberOperation struct {

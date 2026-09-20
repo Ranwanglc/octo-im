@@ -131,6 +131,7 @@ func New(opts *Options) *Server {
 		slot.WithTransport(opts.SlotTransport),
 		slot.WithNode(s.cfgServer),
 		slot.WithOnApply(s.slotApplyLogs),
+		slot.WithApplyErrorRetry(opts.SubscriberRecoveryEnabled),
 		slot.WithOnSaveConfig(s.onSaveSlotConfig),
 		slot.WithRPC(s.rpcClient),
 	))
@@ -295,6 +296,9 @@ func (s *Server) OnConfigChange(cfg *types.Config) {
 func (s *Server) slotApplyLogs(slotId uint32, logs []rafttype.Log) error {
 	err := s.store.ApplySlotLogs(slotId, logs)
 	if err != nil {
+		if !s.opts.SubscriberRecoveryEnabled {
+			s.Panic("apply slot logs failed", zap.Uint32("slotId", slotId), zap.Error(err))
+		}
 		s.Error("apply slot logs failed", zap.Uint32("slotId", slotId), zap.Error(err))
 		return err
 	}

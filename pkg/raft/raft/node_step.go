@@ -89,7 +89,9 @@ func (n *Node) Step(e types.Event) error {
 			n.applyRetryTicks = 0
 		} else {
 			n.queue.applying = false
-			n.backoffApply()
+			if n.opts.ApplyErrorRetry {
+				n.backoffApply()
+			}
 		}
 	default:
 		if n.stepFunc != nil {
