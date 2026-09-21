@@ -147,13 +147,15 @@ type ConversationEffect struct {
 
 // SubscriberWork is source-owned and durably checkpointed after each bounded page.
 type SubscriberWork struct {
+	Paged       bool                 `json:"paged,omitempty"`
+	Total       int                  `json:"total"`
 	LastRetryAt int64                `json:"last_retry_at,omitempty"`
 	Attempts    uint32               `json:"attempts"`
 	NextAttempt int64                `json:"next_attempt,omitempty"`
 	SlotID      uint32               `json:"slot_id"`
 	Operation   SubscriberOperation  `json:"operation"`
 	Version     uint64               `json:"version"`
-	Effects     []ConversationEffect `json:"effects"`
+	Effects     []ConversationEffect `json:"effects,omitempty"` // legacy on-disk format only
 	Next        int                  `json:"next"`
 }
 
@@ -175,6 +177,7 @@ type SubscriberRecoveryDB interface {
 	ApplySubscriberOperation(uint32, uint64, SubscriberOperation) error
 	GetSubscriberReceipt(string, uint8, string) (SubscriberReceipt, bool, error)
 	GetSubscriberWork(string, uint8, uint32, uint64) (SubscriberWork, bool, error)
+	GetSubscriberWorkPage(SubscriberWork, int) ([]ConversationEffect, error)
 	GetSubscriberIntent(string, uint8, string) (ConversationEffect, bool, error)
 	ListSubscriberWork(int, []byte, int) ([]SubscriberWork, []byte, bool, error)
 	CheckpointSubscriberWork(SubscriberCheckpoint) error
@@ -186,6 +189,9 @@ type SubscriberRecoveryDB interface {
 func (wk *wukongDB) GetSubscriberWork(channelID string, channelType uint8, slotID uint32, version uint64) (SubscriberWork, bool, error) {
 	var work SubscriberWork
 	ok, err := recoveryRead(wk.channelDb(channelID, channelType), recoveryPendingKey(slotID, version), &work)
+	if !work.Paged {
+		work.Total = len(work.Effects)
+	}
 	return work, ok, err
 }
 
@@ -550,7 +556,7 @@ func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o Subs
 	if e := storeSubscriberReceipt(batch, slot, r); e != nil {
 		return e
 	}
-	if e := recoverySet(batch, recoveryPendingKey(slot, version), work); e != nil {
+	if e := stageSubscriberWork(batch, work); e != nil {
 		return e
 	}
 	// Charge exactly the persisted effect count plus one finalization unit.
@@ -663,7 +669,10 @@ func (wk *wukongDB) ListSubscriberWork(shard int, after []byte, limit int) ([]Su
 	for valid && len(result) < limit {
 		var w SubscriberWork
 		if e := json.Unmarshal(iter.Value(), &w); e != nil {
-			return nil, nil, false, e
+			return nil, nil, false, &PermanentApplyError{Err: e}
+		}
+		if !w.Paged {
+			w.Total = len(w.Effects)
 		}
 		result = append(result, w)
 		next = bytes.Clone(iter.Key())
@@ -683,6 +692,9 @@ func (wk *wukongDB) CheckpointSubscriberWork(c SubscriberCheckpoint) error {
 	if e != nil || !ok {
 		return e
 	}
+	if !w.Paged {
+		w.Total = len(w.Effects)
+	}
 	if w.Operation.OperationID != c.OperationID || w.Operation.ChannelID != c.ChannelID || w.Operation.ChannelType != c.ChannelType {
 		return &PermanentApplyError{errors.New("recovery checkpoint identity mismatch")}
 	}
@@ -692,7 +704,7 @@ func (wk *wukongDB) CheckpointSubscriberWork(c SubscriberCheckpoint) error {
 	if c.Previous != w.Next {
 		return nil
 	}
-	if c.Next < w.Next || c.Next > len(w.Effects) || (c.Done && c.Next != len(w.Effects)) {
+	if c.Next < w.Next || c.Next > w.Total || (c.Done && c.Next != w.Total) {
 		return &PermanentApplyError{errors.New("invalid recovery progress")}
 	}
 	r, found, e := wk.GetSubscriberReceipt(c.ChannelID, c.ChannelType, c.OperationID)
@@ -709,6 +721,15 @@ func (wk *wukongDB) CheckpointSubscriberWork(c SubscriberCheckpoint) error {
 	batch := db.NewBatch()
 	defer batch.Close()
 	decrement := uint64(c.Next - w.Next)
+	if w.Paged {
+		// Remove only chunks whose final effect has been acknowledged. Partial
+		// chunks stay immutable, including across retries and restarts.
+		for page := w.Next / SubscriberWorkChunkSize; page < c.Next/SubscriberWorkChunkSize; page++ {
+			if e := batch.Delete(recoveryEffectKey(c.SlotID, c.Version, page), wk.noSync); e != nil {
+				return e
+			}
+		}
+	}
 	w.Next = c.Next
 	r.Completed = c.Next
 	if c.RetryAt > 0 {
@@ -731,6 +752,10 @@ func (wk *wukongDB) CheckpointSubscriberWork(c SubscriberCheckpoint) error {
 		r.State = "complete"
 		r.CompletedAt = c.At
 		e = batch.Delete(recoveryPendingKey(c.SlotID, c.Version), wk.noSync)
+		if e == nil && w.Paged {
+			prefix := recoveryEffectPrefix(c.SlotID, c.Version)
+			e = batch.DeleteRange(prefix, append(bytes.Clone(prefix), 0xff), wk.noSync)
+		}
 	} else {
 		e = recoverySet(batch, recoveryPendingKey(c.SlotID, c.Version), w)
 	}

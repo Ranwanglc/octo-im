@@ -12,6 +12,35 @@ import (
 // Shared wire bound for request-path and background proposals.
 const MaxConversationEffects = 64
 
+// Caller holds the recovery user lock. Deleting a recent-conversation row is
+// independent of leaving the channel: a later read-position update may restore
+// an active lifecycle, but must never revive a membership tombstone.
+func (wk *wukongDB) restoreManagedConversation(uid, channel string, tp uint8, seq uint64) error {
+	if !wk.SubscriberRecoveryActive() {
+		return nil
+	}
+	effect, found, err := wk.ConversationLifecycle(uid, channel, tp)
+	if err != nil || !found || effect.Deleted {
+		return err
+	}
+	at := time.Unix(0, effect.CreatedAt)
+	conversation := Conversation{Id: effect.ConversationID, Uid: uid, ChannelId: channel, ChannelType: tp, Type: ConversationTypeChat, ReadToMsgSeq: max(seq, effect.ReadToMsgSeq), CreatedAt: &at, UpdatedAt: &at}
+	batch := wk.sharedBatchDB(uid).NewBatch()
+	if err := wk.writeConversation(conversation, batch); err != nil {
+		return err
+	}
+	// Publish the relation first. If the row commit fails, a Raft retry still
+	// sees a missing row and repeats both writes, repairing the crash gap.
+	if err := wk.setConversationLocalUserRelation([]Conversation{conversation}, true); err != nil {
+		return err
+	}
+	if err := batch.CommitWait(); err != nil {
+		return err
+	}
+	wk.conversationCache.UpdateConversationsInCache([]Conversation{conversation})
+	return nil
+}
+
 func (wk *wukongDB) SubscriberRecoveryActive() bool {
 	return wk.recoveryActive.Load()
 }

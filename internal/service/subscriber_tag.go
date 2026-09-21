@@ -6,22 +6,55 @@ import (
 )
 
 var subscriberTagLocks [64]sync.Mutex
-var subscriberTagVersions [64]uint64 // accessed under the matching lock
 
-// SubscriberTagVersion is captured before reading membership or calling RPC.
-// A collision only retries a fill; it never allows a stale tag to be published.
-func SubscriberTagVersion(ch string, tp uint8) uint64 {
+type subscriberTagIdentity struct {
+	channel string
+	typeID  uint8
+}
+type subscriberTagGeneration struct {
+	version uint64
+	users   int
+}
+
+var subscriberTagVersions [64]map[subscriberTagIdentity]*subscriberTagGeneration
+
+// BeginSubscriberTag tracks only active fills. Generations belong to a channel,
+// while locks remain striped; release reclaims the entry when no fill can still
+// publish an old generation, without retaining every historical channel forever.
+func BeginSubscriberTag(ch string, tp uint8) (uint64, func()) {
 	i := key.ChannelToNum(ch, tp) % 64
+	id := subscriberTagIdentity{ch, tp}
 	subscriberTagLocks[i].Lock()
-	defer subscriberTagLocks[i].Unlock()
-	return subscriberTagVersions[i]
+	if subscriberTagVersions[i] == nil {
+		subscriberTagVersions[i] = make(map[subscriberTagIdentity]*subscriberTagGeneration)
+	}
+	state := subscriberTagVersions[i][id]
+	if state == nil {
+		state = &subscriberTagGeneration{}
+		subscriberTagVersions[i][id] = state
+	}
+	state.users++
+	version := state.version
+	subscriberTagLocks[i].Unlock()
+	var once sync.Once
+	return version, func() {
+		once.Do(func() {
+			subscriberTagLocks[i].Lock()
+			defer subscriberTagLocks[i].Unlock()
+			state.users--
+			if state.users == 0 {
+				delete(subscriberTagVersions[i], id)
+			}
+		})
+	}
 }
 
 func PublishSubscriberTag(ch string, tp uint8, version uint64, tagKey string) bool {
 	i := key.ChannelToNum(ch, tp) % 64
 	subscriberTagLocks[i].Lock()
 	defer subscriberTagLocks[i].Unlock()
-	if subscriberTagVersions[i] != version {
+	state := subscriberTagVersions[i][subscriberTagIdentity{ch, tp}]
+	if state == nil || state.version != version {
 		return false
 	}
 	TagManager.SetChannelTag(ch, tp, tagKey)
@@ -39,7 +72,9 @@ func LockSubscriberTag(ch string, tp uint8) func() {
 func InvalidateSubscriberTag(ch string, tp uint8) {
 	unlock := LockSubscriberTag(ch, tp)
 	defer unlock()
-	subscriberTagVersions[key.ChannelToNum(ch, tp)%64]++
+	if state := subscriberTagVersions[key.ChannelToNum(ch, tp)%64][subscriberTagIdentity{ch, tp}]; state != nil {
+		state.version++
+	}
 	tag := TagManager.GetChannelTag(ch, tp)
 	TagManager.RemoveChannelTag(ch, tp)
 	if tag != "" {

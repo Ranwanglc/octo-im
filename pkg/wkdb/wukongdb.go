@@ -168,6 +168,10 @@ func (wk *wukongDB) Open() error {
 		wk.closeOpenedShards()
 		return err
 	}
+	if err := wk.migrateSubscriberWorkPages(); err != nil {
+		wk.closeOpenedShards()
+		return err
+	}
 	for i, db := range wk.dbs {
 		wkdb := NewBatchDB(i, db)
 		wkdb.Start()

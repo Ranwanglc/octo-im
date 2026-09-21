@@ -72,6 +72,15 @@ func recoveryWork(t *testing.T, db *wukongDB, o SubscriberOperation) SubscriberW
 	require.NoError(t, err)
 	for _, w := range ws {
 		if w.Operation.OperationID == o.OperationID {
+			for at := 0; at < w.Total; {
+				cursor := w
+				cursor.Next = at
+				page, err := db.GetSubscriberWorkPage(cursor, MaxSubscriberWorkPage)
+				require.NoError(t, err)
+				require.NotEmpty(t, page)
+				w.Effects = append(w.Effects, page...)
+				at += len(page)
+			}
 			return w
 		}
 	}
@@ -81,7 +90,7 @@ func recoveryWork(t *testing.T, db *wukongDB, o SubscriberOperation) SubscriberW
 
 func completeRecoveryWork(t *testing.T, db *wukongDB, w SubscriberWork) {
 	t.Helper()
-	require.NoError(t, db.CheckpointSubscriberWork(SubscriberCheckpoint{SlotID: w.SlotID, ChannelID: w.Operation.ChannelID, ChannelType: w.Operation.ChannelType, OperationID: w.Operation.OperationID, Version: w.Version, Previous: w.Next, Next: len(w.Effects), Done: true, At: time.Now().UnixNano()}))
+	require.NoError(t, db.CheckpointSubscriberWork(SubscriberCheckpoint{SlotID: w.SlotID, ChannelID: w.Operation.ChannelID, ChannelType: w.Operation.ChannelType, OperationID: w.Operation.OperationID, Version: w.Version, Previous: w.Next, Next: w.Total, Done: true, At: time.Now().UnixNano()}))
 }
 
 func TestSubscriberRecoveryAtomicAdmissionAndReplay(t *testing.T) {

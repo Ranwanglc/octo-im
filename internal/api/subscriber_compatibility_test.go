@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -24,9 +25,10 @@ import (
 type compatibilityCluster struct {
 	icluster.ICluster
 	icluster.Slot
-	store *store.Store
-	mu    sync.Mutex
-	index uint64
+	store        *store.Store
+	mu           sync.Mutex
+	index        uint64
+	readFloorErr error
 }
 
 type migrationRecoveryDB struct{ wkdb.DB }
@@ -50,7 +52,10 @@ func (*compatibilityCluster) SlotLeaderId(uint32) uint64 { return 1 }
 func (*compatibilityCluster) SlotLeaderOfChannel(string, uint8) (*nodetypes.Node, error) {
 	return &nodetypes.Node{Id: 1}, nil
 }
-func (*compatibilityCluster) LoadOnlyChannelClusterConfig(string, uint8) (wkdb.ChannelClusterConfig, error) {
+func (c *compatibilityCluster) LoadOnlyChannelClusterConfig(string, uint8) (wkdb.ChannelClusterConfig, error) {
+	if c.readFloorErr != nil {
+		return wkdb.ChannelClusterConfig{}, c.readFloorErr
+	}
 	return wkdb.ChannelClusterConfig{}, wkdb.ErrNotFound
 }
 func (c *compatibilityCluster) ProposeUntilAppliedTimeout(ctx context.Context, slot uint32, data []byte) (*types.ProposeResp, error) {
@@ -87,6 +92,10 @@ func TestSubscriberRecoveryMissingChannelHTTPCompatibility(t *testing.T) {
 			body, err := json.Marshal(map[string]any{"channel_id": "missing" + endpoint, "channel_type": 2, "uids": []string{"u"}, "subscribers": []string{"u"}, "operation_id": id})
 			require.NoError(t, err)
 			for i := 0; i < 2; i++ {
+				cluster.readFloorErr = nil
+				if i == 1 {
+					cluster.readFloorErr = errors.New("message leader unavailable after lost response")
+				}
 				request := httptest.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
 				request.Header.Set("Content-Type", "application/json")
 				response := httptest.NewRecorder()
@@ -102,6 +111,7 @@ func TestSubscriberRecoveryMissingChannelHTTPCompatibility(t *testing.T) {
 			info, err := db.GetChannel("missing"+endpoint, 2)
 			require.NoError(t, err)
 			require.True(t, wkdb.IsEmptyChannelInfo(info))
+			cluster.readFloorErr = nil
 		})
 	}
 	parts, err := s.SubscriberBacklog()

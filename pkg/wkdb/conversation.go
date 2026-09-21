@@ -305,7 +305,7 @@ func (wk *wukongDB) UpdateConversationIfSeqGreater(uid, channelId string, channe
 		return err
 	}
 	if IsEmptyConversation(existConversation) {
-		return nil
+		return wk.restoreManagedConversation(uid, channelId, channelType, readToMsgSeq)
 	}
 
 	if existConversation.ReadToMsgSeq >= readToMsgSeq { // 如果当前readToMsgSeq大于或等于传过来的，则不需要更新

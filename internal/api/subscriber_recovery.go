@@ -43,7 +43,8 @@ func (ch *channel) submitSubscriberRecovery(c *wkhttp.Context, o wkdb.Subscriber
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), options.G.SubscriberRecovery.Timeout)
 	defer cancel()
-	if ((o.Mode == "add" || o.Mode == "reset") && len(o.UIDs) > 0 || o.Mode == "deny_set" || o.Mode == "deny_remove" || o.Mode == "deny_remove_all") && o.ChannelType != wkproto.ChannelTypeLive {
+	r, existing, err := service.Store.ExistingSubscriberOperation(o)
+	if err == nil && !existing && ((o.Mode == "add" || o.Mode == "reset") && len(o.UIDs) > 0 || o.Mode == "deny_set" || o.Mode == "deny_remove" || o.Mode == "deny_remove_all") && o.ChannelType != wkproto.ChannelTypeLive {
 		seq, err := ch.s.subscriberReadFloor(ctx, o.ChannelID, o.ChannelType)
 		if err != nil {
 			c.JSON(http.StatusServiceUnavailable, map[string]any{"status": 503, "msg": err.Error(), "operation_id": o.OperationID})
@@ -51,7 +52,9 @@ func (ch *channel) submitSubscriberRecovery(c *wkhttp.Context, o wkdb.Subscriber
 		}
 		o.ReadToMsgSeq = seq
 	}
-	r, err := service.Store.SubmitSubscriberOperation(ctx, o)
+	if err == nil && !existing {
+		r, err = service.Store.SubmitSubscriberOperation(ctx, o)
+	}
 	if err != nil {
 		status := http.StatusServiceUnavailable
 		if errors.Is(err, store.ErrInvalidSubscriberOperation) {

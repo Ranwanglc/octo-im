@@ -269,17 +269,21 @@ func (h *Handler) requestTag(leaderId uint64, tagKey string) (*types.Tag, error)
 
 func (h *Handler) getOrMakeTagForLeader(fakeChannelId string, channelType uint8) (*types.Tag, error) {
 	for attempt := 0; attempt < 3; attempt++ {
-		version := service.SubscriberTagVersion(fakeChannelId, channelType)
+		version, release := service.BeginSubscriberTag(fakeChannelId, channelType)
 		tagKey := service.TagManager.GetChannelTag(fakeChannelId, channelType)
 		if tag := service.TagManager.Get(tagKey); tag != nil {
+			release()
 			return tag, nil
 		}
 		// Membership reads and RPC must not hold the invalidation lock.
 		tag, err := h.makeChannelTag(fakeChannelId, channelType)
 		if err != nil {
+			release()
 			return nil, err
 		}
-		if service.PublishSubscriberTag(fakeChannelId, channelType, version, tag.Key) {
+		published := service.PublishSubscriberTag(fakeChannelId, channelType, version, tag.Key)
+		release()
+		if published {
 			return tag, nil
 		}
 		service.TagManager.RemoveTag(tag.Key)

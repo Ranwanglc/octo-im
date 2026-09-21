@@ -93,6 +93,31 @@ func TestSlotApplyUnknownCommandNeverAdvances(t *testing.T) {
 	require.Zero(t, index)
 }
 
+func TestSlotApplyRetiredCommandsRemainReplayCompatible(t *testing.T) {
+	s, _ := recoveryStore(t)
+	retired := []CMDType{
+		_cmdSaveStreamMetaRemoved, _cmdStreamEndRemoved, _cmdAppendStreamItemRemoved,
+		_cmdAddStreamMetaRemoved, _cmdAddStreamsRemoved, _cmdSaveStreamV2Removed,
+		CMDAppendMessagesOfNotifyQueue, CMDRemoveMessagesOfNotifyQueue,
+		CMDDeleteChannelAndClearMessages, CMDChannelClusterConfigDelete,
+		CMDAddOrUpdatePlugin, CMDUpdatePluginConfig,
+	}
+	var logs []types.Log
+	for i, cmd := range retired {
+		logs = append(logs, applyTestLog(t, uint64(i+1), cmd, []byte("historic payload")))
+	}
+	// A normal command following the retired entries must still run.
+	logs = append(logs, applyTestLog(t, uint64(len(logs)+1), CMDAddDenylist, EncodeMembers("g", 2, []wkdb.Member{{Uid: "a"}})))
+	require.NoError(t, s.ApplySlotLogs(0, logs))
+	require.NoError(t, s.ApplySlotLogs(0, logs))
+	index, err := s.DB().SlotAppliedIndex(0)
+	require.NoError(t, err)
+	require.EqualValues(t, len(logs), index)
+	members, err := s.DB().GetDenylist("g", 2)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+}
+
 func TestSlotApplyRecoveryPrefixCannotUndoInterruptedLegacyDelete(t *testing.T) {
 	s, slots := recoveryStore(t)
 	db := s.DB()

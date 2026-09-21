@@ -38,6 +38,9 @@ func (s *recoverySlots) GetSlotId(v string) uint32 {
 	return h.Sum32() % 8
 }
 func (s *recoverySlots) SlotLeaderId(uint32) uint64 { return s.leader.Load() }
+func (s *recoverySlots) ProposeUntilApplied(slot uint32, data []byte) (*types.ProposeResp, error) {
+	return s.ProposeUntilAppliedTimeout(context.Background(), slot, data)
+}
 func (s *recoverySlots) ProposeUntilAppliedTimeout(ctx context.Context, slot uint32, data []byte) (*types.ProposeResp, error) {
 	cmd := &CMD{}
 	if err := cmd.Unmarshal(data); err != nil {
@@ -456,6 +459,8 @@ func TestRecoveryPausedAfterRestartFencesOldPendingWork(t *testing.T) {
 	old, err := s.SubmitSubscriberOperation(context.Background(), wkdb.SubscriberOperation{OperationID: "old", ChannelID: "g", ChannelType: 2, Mode: "add", UIDs: []string{"a"}})
 	require.NoError(t, err)
 	work, found, err := s.DB().GetSubscriberWork("g", 2, slots.GetSlotId("g"), old.Version)
+	effects, pageErr := s.DB().GetSubscriberWorkPage(work, wkdb.MaxSubscriberWorkPage)
+	require.NoError(t, pageErr)
 	require.NoError(t, err)
 	require.True(t, found)
 	s.Stop()
@@ -470,7 +475,7 @@ func TestRecoveryPausedAfterRestartFencesOldPendingWork(t *testing.T) {
 	removed, err = s.CompleteSubscriberOperation(context.Background(), removed)
 	require.NoError(t, err)
 	require.Equal(t, "complete", removed.State)
-	require.NoError(t, s.DB().ApplyConversationEffects(work.Effects), "delayed old add must be harmless")
+	require.NoError(t, s.DB().ApplyConversationEffects(effects), "delayed old add must be harmless")
 	_, err = s.DB().GetConversation("a", "g", 2)
 	require.ErrorIs(t, err, wkdb.ErrNotFound)
 	require.Zero(t, s.SubscriberRecoveryStats().Workers)

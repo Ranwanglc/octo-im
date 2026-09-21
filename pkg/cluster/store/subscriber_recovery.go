@@ -112,6 +112,39 @@ func (s *Store) SubscriberRecoveryStats() SubscriberRecoveryStats {
 	return s.recovery.stats
 }
 
+func canonicalSubscriberUIDs(uids []string) []string {
+	uids = append([]string(nil), uids...)
+	sort.Strings(uids)
+	unique := uids[:0]
+	for _, uid := range uids {
+		if len(unique) == 0 || unique[len(unique)-1] != uid {
+			unique = append(unique, uid)
+		}
+	}
+	return unique
+}
+
+// ExistingSubscriberOperation is checked before any admission-only dependency
+// (message-leader read floor, restore-set reads). A receipt already owns those
+// immutable inputs, so a lost-response retry can resume or return completion.
+func (s *Store) ExistingSubscriberOperation(o wkdb.SubscriberOperation) (wkdb.SubscriberReceipt, bool, error) {
+	if o.OperationID == "" {
+		return wkdb.SubscriberReceipt{}, false, nil
+	}
+	if s.opts.Slot.SlotLeaderId(s.opts.Slot.GetSlotId(o.ChannelID)) != s.opts.NodeId {
+		return wkdb.SubscriberReceipt{}, false, errors.New("subscriber source leader changed")
+	}
+	r, found, err := s.wdb.GetSubscriberReceipt(o.ChannelID, o.ChannelType, o.OperationID)
+	if err != nil || !found {
+		return r, found, err
+	}
+	o.UIDs = canonicalSubscriberUIDs(o.UIDs)
+	if r.Digest != o.Digest() {
+		return r, false, ErrSubscriberConflict
+	}
+	return r, r.State != "rejected" || (r.Error != "backlog_full" && r.Error != "restore_set_changed"), nil
+}
+
 func (s *Store) SubmitSubscriberOperation(ctx context.Context, o wkdb.SubscriberOperation) (wkdb.SubscriberReceipt, error) {
 	if s.recovery == nil {
 		return wkdb.SubscriberReceipt{}, errors.New("subscriber recovery is disabled")
@@ -119,15 +152,7 @@ func (s *Store) SubmitSubscriberOperation(ctx context.Context, o wkdb.Subscriber
 	if len(o.UIDs) > wkdb.MaxSubscriberOperationMembers {
 		return wkdb.SubscriberReceipt{}, fmt.Errorf("%w: too many subscribers", ErrInvalidSubscriberOperation)
 	}
-	o.UIDs = append([]string(nil), o.UIDs...)
-	sort.Strings(o.UIDs)
-	unique := o.UIDs[:0]
-	for _, uid := range o.UIDs {
-		if len(unique) == 0 || unique[len(unique)-1] != uid {
-			unique = append(unique, uid)
-		}
-	}
-	o.UIDs = unique
+	o.UIDs = canonicalSubscriberUIDs(o.UIDs)
 	if o.OperationID == "" {
 		o.OperationID = wkutil.GenUUID()
 	}
@@ -326,49 +351,49 @@ func (s *Store) proposeRecovery(ctx context.Context, slot uint32, tp CMDType, v 
 
 func (s *Store) applySubscriberRecovery(slot uint32, cmd *CMD, index uint64) error {
 	if len(cmd.Data) > wkdb.MaxSubscriberOperationBytes*8 {
-		return &PermanentApplyError{errors.New("recovery command too large")}
+		return &PermanentApplyError{Err: errors.New("recovery command too large")}
 	}
 	switch cmd.CmdType {
 	case CMDSubscriberOperation:
 		var o wkdb.SubscriberOperation
 		if err := json.Unmarshal(cmd.Data, &o); err != nil {
-			return &PermanentApplyError{err}
+			return &PermanentApplyError{Err: err}
 		}
 		if s.opts.Slot.GetSlotId(o.ChannelID) != slot {
-			return &PermanentApplyError{errors.New("subscriber operation routed to wrong slot")}
+			return &PermanentApplyError{Err: errors.New("subscriber operation routed to wrong slot")}
 		}
 		if err := o.Validate(); err != nil {
-			return &PermanentApplyError{err}
+			return &PermanentApplyError{Err: err}
 		}
 		return s.wdb.ApplySubscriberOperation(slot, index, o)
 	case CMDConversationEffects:
 		var effects []wkdb.ConversationEffect
 		if err := json.Unmarshal(cmd.Data, &effects); err != nil {
-			return &PermanentApplyError{err}
+			return &PermanentApplyError{Err: err}
 		}
 		if len(effects) == 0 || len(effects) > wkdb.MaxConversationEffects {
-			return &PermanentApplyError{errors.New("invalid conversation effect page")}
+			return &PermanentApplyError{Err: errors.New("invalid conversation effect page")}
 		}
 		for _, e := range effects {
 			if e.UID == "" || e.ChannelID == "" || e.ChannelType == 0 || e.Version == 0 || (!e.Deleted && e.ConversationID == 0) || e.CreatedAt <= 0 {
-				return &PermanentApplyError{errors.New("invalid conversation effect")}
+				return &PermanentApplyError{Err: errors.New("invalid conversation effect")}
 			}
 			if s.opts.Slot.GetSlotId(e.UID) != slot {
-				return &PermanentApplyError{errors.New("conversation effect routed to wrong slot")}
+				return &PermanentApplyError{Err: errors.New("conversation effect routed to wrong slot")}
 			}
 		}
 		return s.wdb.ApplyConversationEffects(effects)
 	case CMDSubscriberCheckpoint:
 		var c wkdb.SubscriberCheckpoint
 		if err := json.Unmarshal(cmd.Data, &c); err != nil {
-			return &PermanentApplyError{err}
+			return &PermanentApplyError{Err: err}
 		}
 		if c.SlotID != slot || s.opts.Slot.GetSlotId(c.ChannelID) != slot {
-			return &PermanentApplyError{errors.New("subscriber checkpoint routed to wrong slot")}
+			return &PermanentApplyError{Err: errors.New("subscriber checkpoint routed to wrong slot")}
 		}
 		return s.wdb.CheckpointSubscriberWork(c)
 	}
-	return &PermanentApplyError{errors.New("unknown recovery command")}
+	return &PermanentApplyError{Err: errors.New("unknown recovery command")}
 }
 
 func (s *Store) runSubscriberRecovery(ctx context.Context, worker int) {
@@ -469,9 +494,13 @@ func (s *Store) processSubscriberWorkPage(ctx context.Context, w wkdb.Subscriber
 	if s.opts.Slot.SlotLeaderId(w.SlotID) != s.opts.NodeId {
 		return errors.New("subscriber source leader changed")
 	}
-	next := min(w.Next+pageSize, len(w.Effects))
+	page, err := s.wdb.GetSubscriberWorkPage(w, pageSize)
+	if err != nil {
+		return err
+	}
+	next := w.Next + len(page)
 	bySlot := make(map[uint32][]wkdb.ConversationEffect)
-	for _, e := range w.Effects[w.Next:next] {
+	for _, e := range page {
 		latest, found, err := s.wdb.GetSubscriberIntent(e.ChannelID, e.ChannelType, e.UID)
 		if err != nil {
 			return err
@@ -502,7 +531,7 @@ func (s *Store) processSubscriberWorkPage(ctx context.Context, w wkdb.Subscriber
 	if err := g.Wait(); err != nil {
 		return err
 	}
-	done := next == len(w.Effects)
+	done := next == w.Total
 	if done {
 		if err := s.recovery.finalize(ctx, w); err != nil {
 			return fmt.Errorf("subscriber finalization: %w", err)
