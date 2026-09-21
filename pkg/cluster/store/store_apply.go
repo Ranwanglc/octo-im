@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -14,10 +15,21 @@ import (
 // ApplySlotLogs preserves log order. Only contiguous config saves can be
 // grouped; delaying conversation writes past removals can resurrect rows.
 func (s *Store) ApplySlotLogs(slotId uint32, logs []types.Log) error {
+	lock, _ := s.applyLocks.LoadOrStore(slotId, &sync.Mutex{})
+	lock.(*sync.Mutex).Lock()
+	defer lock.(*sync.Mutex).Unlock()
+	applied, err := s.wdb.SlotAppliedIndex(slotId)
+	if err != nil {
+		return err
+	}
 	for i := 0; i < len(logs); {
+		if logs[i].Index <= applied {
+			i++
+			continue
+		}
 		cmd := &CMD{}
 		if err := cmd.Unmarshal(logs[i].Data); err != nil {
-			return err
+			return &PermanentApplyError{err}
 		}
 		if cmd.CmdType == CMDChannelClusterConfigSave {
 			cmds := []*CMD{cmd}
@@ -26,7 +38,7 @@ func (s *Store) ApplySlotLogs(slotId uint32, logs []types.Log) error {
 			for i < len(logs) {
 				next := &CMD{}
 				if err := next.Unmarshal(logs[i].Data); err != nil {
-					return err
+					return &PermanentApplyError{err}
 				}
 				if next.CmdType != CMDChannelClusterConfigSave {
 					break
@@ -44,12 +56,32 @@ func (s *Store) ApplySlotLogs(slotId uint32, logs []types.Log) error {
 			}
 			i++
 		}
+		applied = logs[i-1].Index
+		// Recovery entries have transactional version/progress fences. They can
+		// replay a successful prefix, so share its checkpoint at the batch end.
+		// Legacy entries must checkpoint individually before any later entry:
+		// replaying an older legacy write after a newer write is not generally safe.
+		switch cmd.CmdType {
+		case CMDSubscriberOperation, CMDConversationEffects, CMDSubscriberCheckpoint:
+			if i < len(logs) {
+				continue
+			}
+		}
+		if err := s.wdb.SetSlotAppliedIndex(slotId, applied); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func (s *Store) applyCMDForSlot(slot uint32, cmd *CMD, index uint64) error {
 	switch cmd.CmdType {
+	case CMDAppendMessageEvent:
+		event, err := cmd.DecodeCMDMessageEvent(cmd.version)
+		if err != nil {
+			return &PermanentApplyError{err}
+		}
+		return s.wdb.AppendMessageEventForSlot(slot, index, event)
 	case CMDSubscriberOperation, CMDConversationEffects, CMDSubscriberCheckpoint:
 		return s.applySubscriberRecovery(slot, cmd, index)
 	default:
@@ -59,6 +91,8 @@ func (s *Store) applyCMDForSlot(slot uint32, cmd *CMD, index uint64) error {
 
 func (s *Store) applyCMD(cmd *CMD, logIndex uint64) error {
 	switch cmd.CmdType {
+	case _cmdSaveStreamMetaRemoved, _cmdStreamEndRemoved, _cmdAppendStreamItemRemoved, _cmdAddStreamMetaRemoved, _cmdAddStreamsRemoved, _cmdSaveStreamV2Removed:
+		return nil // known retired commands remain replay-compatible
 	case CMDChannelClusterConfigSave: // 保存频道分布式配置
 		return s.handleChannelClusterConfigSave(cmd, logIndex)
 	case CMDAddOrUpdateConversations: // 添加或更新会话
@@ -133,16 +167,23 @@ func (s *Store) applyCMD(cmd *CMD, logIndex uint64) error {
 		return s.handleUpdateConversationIfSeqGreater(cmd)
 	default:
 		s.Error("unknown cmd type", zap.String("cmdType", cmd.CmdType.String()))
-		return nil
+		return &PermanentApplyError{fmt.Errorf("unknown slot command %d", cmd.CmdType)}
 	}
 }
+
+// PermanentApplyError indicates an incompatible or malformed committed entry;
+// retrying it cannot repair the state machine. Storage failures remain retryable.
+type PermanentApplyError struct{ Err error }
+
+func (e *PermanentApplyError) Error() string { return e.Err.Error() }
+func (e *PermanentApplyError) Unwrap() error { return e.Err }
 
 func (s *Store) applyLog(slot uint32, log types.Log) error {
 	cmd := &CMD{}
 	err := cmd.Unmarshal(log.Data)
 	if err != nil {
 		s.Error("unmarshal cmd err", zap.Error(err), zap.Uint64("index", log.Index), zap.ByteString("data", log.Data))
-		return err
+		return &PermanentApplyError{err}
 	}
 
 	return s.applyCMDForSlot(slot, cmd, log.Index)
@@ -182,12 +223,12 @@ func (s *Store) loopSaveChannelClusterConfig() {
 func (s *Store) handleChannelClusterConfigSave(cmd *CMD, confVersion uint64) error {
 	_, _, configData, err := cmd.DecodeCMDChannelClusterConfigSave()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	channelClusterConfig := wkdb.ChannelClusterConfig{}
 	err = channelClusterConfig.Unmarshal(configData)
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	channelClusterConfig.ConfVersion = confVersion
 
@@ -199,14 +240,14 @@ func (s *Store) handleChannelClusterConfigSave(cmd *CMD, confVersion uint64) err
 		errCh: waitC,
 	}:
 	case <-s.stopper.ShouldStop():
-		return nil
+		return ErrStoreStopped
 	}
 
 	select {
 	case err := <-waitC:
 		return err
 	case <-s.stopper.ShouldStop():
-		return nil
+		return ErrStoreStopped
 	}
 }
 
@@ -216,12 +257,12 @@ func (s *Store) handleChannelClusterConfigSavesForCMDs(cmds []*CMD, confVersions
 	for i, cmd := range cmds {
 		_, _, configData, err := cmd.DecodeCMDChannelClusterConfigSave()
 		if err != nil {
-			return err
+			return &PermanentApplyError{err}
 		}
 		channelClusterConfig := wkdb.ChannelClusterConfig{}
 		err = channelClusterConfig.Unmarshal(configData)
 		if err != nil {
-			return err
+			return &PermanentApplyError{err}
 		}
 		channelClusterConfig.ConfVersion = confVersions[i]
 		waitC := make(chan error, 1)
@@ -232,7 +273,7 @@ func (s *Store) handleChannelClusterConfigSavesForCMDs(cmds []*CMD, confVersions
 			errCh: waitC,
 		}:
 		case <-s.stopper.ShouldStop():
-			return nil
+			return ErrStoreStopped
 		}
 
 	}
@@ -247,7 +288,7 @@ func (s *Store) handleChannelClusterConfigSavesForCMDs(cmds []*CMD, confVersions
 		case <-timeoutCtx.Done():
 			return timeoutCtx.Err()
 		case <-s.stopper.ShouldStop():
-			return nil
+			return ErrStoreStopped
 		}
 	}
 	return nil
@@ -257,7 +298,7 @@ func (s *Store) handleAddSubscribers(cmd *CMD) error {
 	channelId, channelType, members, err := cmd.DecodeMembers()
 	if err != nil {
 		s.Error("decode subscribers err", zap.Error(err), zap.String("channelID", channelId), zap.Uint8("channelType", channelType), zap.ByteString("data", cmd.Data))
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.AddSubscribers(channelId, channelType, members)
 }
@@ -265,7 +306,7 @@ func (s *Store) handleAddSubscribers(cmd *CMD) error {
 func (s *Store) handleRemoveSubscribers(cmd *CMD) error {
 	channelId, channelType, subscribers, err := cmd.DecodeChannelUids()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.RemoveSubscribers(channelId, channelType, subscribers)
 }
@@ -273,7 +314,7 @@ func (s *Store) handleRemoveSubscribers(cmd *CMD) error {
 func (s *Store) handleAddUser(cmd *CMD) error {
 	u, err := cmd.DecodeCMDUser()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.AddUser(u)
 }
@@ -281,7 +322,7 @@ func (s *Store) handleAddUser(cmd *CMD) error {
 func (s *Store) handleUpdateUser(cmd *CMD) error {
 	u, err := cmd.DecodeCMDUser()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.UpdateUser(u)
 }
@@ -289,7 +330,7 @@ func (s *Store) handleUpdateUser(cmd *CMD) error {
 func (s *Store) handleAddDevice(cmd *CMD) error {
 	u, err := cmd.DecodeCMDDevice()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.AddDevice(u)
 }
@@ -297,7 +338,7 @@ func (s *Store) handleAddDevice(cmd *CMD) error {
 func (s *Store) handleUpdateDevice(cmd *CMD) error {
 	u, err := cmd.DecodeCMDDevice()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.UpdateDevice(u)
 }
@@ -305,7 +346,7 @@ func (s *Store) handleUpdateDevice(cmd *CMD) error {
 func (s *Store) handleAddChannelInfo(cmd *CMD) error {
 	channelInfo, err := cmd.DecodeChannelInfo()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	_, err = s.wdb.AddChannel(channelInfo)
 	return err
@@ -314,7 +355,7 @@ func (s *Store) handleAddChannelInfo(cmd *CMD) error {
 func (s *Store) handleUpdateChannel(cmd *CMD) error {
 	channelInfo, err := cmd.DecodeChannelInfo()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	err = s.wdb.UpdateChannel(channelInfo)
 	return err
@@ -323,7 +364,7 @@ func (s *Store) handleUpdateChannel(cmd *CMD) error {
 func (s *Store) handleRemoveAllSubscriber(cmd *CMD) error {
 	channelId, channelType, err := cmd.DecodeChannel()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.RemoveAllSubscriber(channelId, channelType)
 }
@@ -331,7 +372,7 @@ func (s *Store) handleRemoveAllSubscriber(cmd *CMD) error {
 func (s *Store) handleDeleteChannel(cmd *CMD) error {
 	channelId, channelType, err := cmd.DecodeChannel()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.DeleteChannel(channelId, channelType)
 }
@@ -339,7 +380,7 @@ func (s *Store) handleDeleteChannel(cmd *CMD) error {
 func (s *Store) handleAddDenylist(cmd *CMD) error {
 	channelId, channelType, members, err := cmd.DecodeMembers()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.AddDenylist(channelId, channelType, members)
 }
@@ -347,7 +388,7 @@ func (s *Store) handleAddDenylist(cmd *CMD) error {
 func (s *Store) handleRemoveDenylist(cmd *CMD) error {
 	channelId, channelType, subscribers, err := cmd.DecodeChannelUids()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.RemoveDenylist(channelId, channelType, subscribers)
 }
@@ -355,7 +396,7 @@ func (s *Store) handleRemoveDenylist(cmd *CMD) error {
 func (s *Store) handleRemoveAllDenylist(cmd *CMD) error {
 	channelId, channelType, err := cmd.DecodeChannel()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.RemoveAllDenylist(channelId, channelType)
 }
@@ -363,7 +404,7 @@ func (s *Store) handleRemoveAllDenylist(cmd *CMD) error {
 func (s *Store) handleAddAllowlist(cmd *CMD) error {
 	channelId, channelType, subscribers, err := cmd.DecodeMembers()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.AddAllowlist(channelId, channelType, subscribers)
 }
@@ -371,7 +412,7 @@ func (s *Store) handleAddAllowlist(cmd *CMD) error {
 func (s *Store) handleRemoveAllowlist(cmd *CMD) error {
 	channelId, channelType, subscribers, err := cmd.DecodeChannelUids()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.RemoveAllowlist(channelId, channelType, subscribers)
 }
@@ -379,7 +420,7 @@ func (s *Store) handleRemoveAllowlist(cmd *CMD) error {
 func (s *Store) handleRemoveAllAllowlist(cmd *CMD) error {
 	channelId, channelType, err := cmd.DecodeChannel()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.RemoveAllAllowlist(channelId, channelType)
 }
@@ -389,7 +430,7 @@ func (s *Store) handleAddOrUpdateUserConversationsForCMDs(cmds []*CMD) error {
 	for _, cmd := range cmds {
 		uid, conversations, err := cmd.DecodeCMDAddOrUpdateUserConversations()
 		if err != nil {
-			return err
+			return &PermanentApplyError{err}
 		}
 		conversationMap[uid] = append(conversationMap[uid], conversations...)
 	}
@@ -406,7 +447,7 @@ func (s *Store) handleAddOrUpdateUserConversationsForCMDs(cmds []*CMD) error {
 func (s *Store) handleAddOrUpdateUserConversations(cmd *CMD) error {
 	uid, conversations, err := cmd.DecodeCMDAddOrUpdateUserConversations()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.AddOrUpdateConversationsWithUser(uid, conversations)
 }
@@ -414,7 +455,7 @@ func (s *Store) handleAddOrUpdateUserConversations(cmd *CMD) error {
 func (s *Store) handleDeleteConversation(cmd *CMD) error {
 	uid, deleteChannelID, deleteChannelType, err := cmd.DecodeCMDDeleteConversation()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.DeleteConversation(uid, deleteChannelID, deleteChannelType)
 }
@@ -422,7 +463,7 @@ func (s *Store) handleDeleteConversation(cmd *CMD) error {
 func (s *Store) handleDeleteConversations(cmd *CMD) error {
 	uid, channels, err := cmd.DecodeCMDDeleteConversations()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.DeleteConversations(uid, channels)
 }
@@ -462,7 +503,7 @@ func (s *Store) handleChannelClusterConfigSaves(reqs []*channelCfgReq) error {
 func (s *Store) handleBatchUpdateConversation(cmd *CMD) error {
 	models, err := cmd.DecodeCMDBatchUpdateConversation()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	for _, model := range models {
 		var conversationType = wkdb.ConversationTypeChat
@@ -504,7 +545,7 @@ func (s *Store) handleBatchUpdateConversation(cmd *CMD) error {
 func (s *Store) handleSystemUIDsAdd(cmd *CMD) error {
 	uids, err := cmd.DecodeCMDSystemUIDs()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.AddSystemUids(uids)
 }
@@ -512,7 +553,7 @@ func (s *Store) handleSystemUIDsAdd(cmd *CMD) error {
 func (s *Store) handleSystemUIDsRemove(cmd *CMD) error {
 	uids, err := cmd.DecodeCMDSystemUIDs()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.RemoveSystemUids(uids)
 }
@@ -523,7 +564,7 @@ func (s *Store) handleAddOrUpdateConversations(cmd *CMD) error {
 		s.Error("handleAddOrUpdateConversations: failed to decode conversations",
 			zap.Error(err),
 			zap.Int("dataLen", len(cmd.Data)))
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.AddOrUpdateConversations(conversations)
 }
@@ -531,7 +572,7 @@ func (s *Store) handleAddOrUpdateConversations(cmd *CMD) error {
 func (s *Store) handleAddOrUpdateTester(cmd *CMD) error {
 	tester, err := cmd.DecodeCMDAddOrUpdateTester()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.AddOrUpdateTester(tester)
 }
@@ -539,7 +580,7 @@ func (s *Store) handleAddOrUpdateTester(cmd *CMD) error {
 func (s *Store) handleRemoveTester(cmd *CMD) error {
 	no, err := cmd.DecodeCMDRemoveTester()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.RemoveTester(no)
 }
@@ -547,7 +588,7 @@ func (s *Store) handleRemoveTester(cmd *CMD) error {
 func (s *Store) handleUpdateUserPluginNo(cmd *CMD) error {
 	pluginUser, err := cmd.DecodeCMDUserPluginNo()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.AddOrUpdatePluginUsers([]wkdb.PluginUser{
 		pluginUser,
@@ -557,7 +598,7 @@ func (s *Store) handleUpdateUserPluginNo(cmd *CMD) error {
 func (s *Store) handleRemovePluginUser(cmd *CMD) error {
 	pluginNo, uid, err := cmd.DecodeCMDPluginUser()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.RemovePluginUser(pluginNo, uid)
 }
@@ -570,7 +611,7 @@ func (s *Store) handleAddOrUpdateConversationsBatchIfNotExistForCMDs(cmds []*CMD
 			s.Error("handleAddOrUpdateConversationsBatchIfNotExistForCMDs: failed to decode conversations",
 				zap.Error(err),
 				zap.Int("dataLen", len(cmd.Data)))
-			return err
+			return &PermanentApplyError{err}
 		}
 		conversations = append(conversations, cns...)
 	}
@@ -583,7 +624,7 @@ func (s *Store) handleAddOrUpdateConversationsBatchIfNotExist(cmd *CMD) error {
 		s.Error("handleAddOrUpdateConversationsBatchIfNotExist: failed to decode conversations",
 			zap.Error(err),
 			zap.Int("dataLen", len(cmd.Data)))
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.AddOrUpdateConversationsBatchIfNotExist(conversations)
 }
@@ -591,7 +632,7 @@ func (s *Store) handleAddOrUpdateConversationsBatchIfNotExist(cmd *CMD) error {
 func (s *Store) handleUpdateConversationDeletedAtMsgSeq(cmd *CMD) error {
 	uid, channelId, channelType, deletedAtMsgSeq, err := cmd.DecodeCMDUpdateConversationDeletedAtMsgSeq()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.UpdateConversationDeletedAtMsgSeq(uid, channelId, channelType, deletedAtMsgSeq)
 }
@@ -599,7 +640,7 @@ func (s *Store) handleUpdateConversationDeletedAtMsgSeq(cmd *CMD) error {
 func (s *Store) handleAppendMessageEvent(cmd *CMD) error {
 	event, err := cmd.DecodeCMDMessageEvent(cmd.version)
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	_, _, err = s.wdb.AppendMessageEventWithState(event)
 	return err
@@ -624,7 +665,7 @@ func (s *Store) handleAppendMessageEvent(cmd *CMD) error {
 func (s *Store) handleUpdateConversationIfSeqGreater(cmd *CMD) error {
 	uid, channelId, channelType, readToMsgSeq, err := cmd.DecodeCMDUpdateConversationIfSeqGreater()
 	if err != nil {
-		return err
+		return &PermanentApplyError{err}
 	}
 	return s.wdb.UpdateConversationIfSeqGreater(uid, channelId, channelType, readToMsgSeq)
 }

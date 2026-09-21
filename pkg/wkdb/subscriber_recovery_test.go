@@ -87,9 +87,15 @@ func completeRecoveryWork(t *testing.T, db *wukongDB, w SubscriberWork) {
 func TestSubscriberRecoveryAtomicAdmissionAndReplay(t *testing.T) {
 	db := recoveryTestDB(t, t.TempDir())
 	defer db.Close()
+	seed := recoveryOperation("seed", "add")
+	seed.ChannelID = "seed-channel"
+	for db.GetChannelShardIndex(seed.ChannelID, 2) != db.GetChannelShardIndex("group", 2) {
+		seed.ChannelID += "x"
+	}
+	require.NoError(t, db.ApplySubscriberOperation(1, 1, seed))
 	o := recoveryOperation("join", "add", "a", "b")
 	o.MaxPending = 2
-	require.NoError(t, db.ApplySubscriberOperation(1, 1, o))
+	require.NoError(t, db.ApplySubscriberOperation(1, 2, o))
 	r, ok, err := db.GetSubscriberReceipt("group", 2, "join")
 	require.NoError(t, err)
 	require.True(t, ok)
@@ -100,8 +106,9 @@ func TestSubscriberRecoveryAtomicAdmissionAndReplay(t *testing.T) {
 	ch, err := db.GetChannel("group", 2)
 	require.NoError(t, err)
 	require.True(t, IsEmptyChannelInfo(ch))
+	completeRecoveryWork(t, db, recoveryWork(t, db, seed))
 	o.MaxPending = 10
-	require.NoError(t, db.ApplySubscriberOperation(1, 2, o))
+	require.NoError(t, db.ApplySubscriberOperation(1, 3, o))
 	members, err = db.GetSubscribers("group", 2)
 	require.NoError(t, err)
 	require.Len(t, members, 2)
@@ -110,8 +117,8 @@ func TestSubscriberRecoveryAtomicAdmissionAndReplay(t *testing.T) {
 	completeRecoveryWork(t, db, w)
 	// Both an HTTP retry with a new log index and a replay of the original log
 	// retain the completed receipt instead of regenerating work.
+	require.NoError(t, db.ApplySubscriberOperation(1, 4, o))
 	require.NoError(t, db.ApplySubscriberOperation(1, 3, o))
-	require.NoError(t, db.ApplySubscriberOperation(1, 2, o))
 	ws, _, _, err := db.ListSubscriberWork(int(db.GetChannelShardIndex("group", 2)), nil, 64)
 	require.NoError(t, err)
 	require.Empty(t, ws)
@@ -120,7 +127,7 @@ func TestSubscriberRecoveryAtomicAdmissionAndReplay(t *testing.T) {
 	require.Equal(t, "complete", r.State)
 	conflict := o
 	conflict.Mode = "remove"
-	require.NoError(t, db.ApplySubscriberOperation(1, 4, conflict))
+	require.NoError(t, db.ApplySubscriberOperation(1, 5, conflict))
 	members, err = db.GetSubscribers("group", 2)
 	require.NoError(t, err)
 	require.Len(t, members, 2)
@@ -149,6 +156,7 @@ func TestSubscriberRecoveryRestartCheckpointAndReset(t *testing.T) {
 	cp.Next = 1
 	cp.RetryAt = time.Now().Add(time.Minute).UnixNano()
 	cp.Error = "target unavailable"
+	require.NoError(t, db.CheckpointSubscriberWork(cp))
 	require.NoError(t, db.CheckpointSubscriberWork(cp))
 	require.NoError(t, db.Close())
 	db = reopenRecoveryTestDB(t, dir)
@@ -317,7 +325,6 @@ func TestSubscriberRecoveryResetRejectionKeepsOriginalMembers(t *testing.T) {
 	defer db.Close()
 	o := recoveryOperation("initial", "add", "a", "b")
 	require.NoError(t, db.ApplySubscriberOperation(1, 1, o))
-	completeRecoveryWork(t, db, recoveryWork(t, db, o))
 	reset := recoveryOperation("too-small", "reset", "c")
 	reset.MaxPending = 2
 	require.NoError(t, db.ApplySubscriberOperation(1, 2, reset))

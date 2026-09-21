@@ -1,12 +1,14 @@
 package slot
 
 import (
+	"context"
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 )
 
 type Options struct {
+	BeforePropose func(context.Context, uint32, types.ProposeReqSet) error
 	// 节点Id
 	NodeId uint64
 	// 数据目录
@@ -43,6 +45,10 @@ func NewOptions(opt ...Option) *Options {
 }
 
 type Option func(*Options)
+
+func WithBeforePropose(f func(context.Context, uint32, types.ProposeReqSet) error) Option {
+	return func(o *Options) { o.BeforePropose = f }
+}
 
 func WithNodeId(nodeId uint64) Option {
 	return func(o *Options) {

@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
@@ -26,6 +27,7 @@ func newRpcServer(s *Server) *rpcServer {
 }
 
 func (r *rpcServer) setRoutes() {
+	r.s.netServer.Route(subscriberCapabilityPath, func(c *wkserver.Context) { c.Write([]byte("2")) })
 	// 频道提案
 	r.s.netServer.Route("/rpc/channel/propose", r.handleChannelPropose)
 
@@ -341,6 +343,10 @@ func (r *rpcServer) handleClusterJoin(c *wkserver.Context) {
 			return
 		}
 		c.Write(data)
+		return
+	}
+	if (r.s.opts.SubscriberRecoveryEnabled || r.s.db.SubscriberRecoveryActive()) && req.SubscriberProtocol < subscriberProtocolVersion {
+		c.WriteErr(fmt.Errorf("joining node must support subscriber protocol %d", subscriberProtocolVersion))
 		return
 	}
 

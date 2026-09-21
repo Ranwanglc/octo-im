@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"sync"
 	"sync/atomic"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
@@ -13,6 +14,7 @@ import (
 var ErrLegacySubscriberMutationDisabled = errors.New("legacy subscriber mutation is disabled while subscriber recovery is active")
 
 type Store struct {
+	applyLocks      sync.Map // slot ID -> *sync.Mutex; independent slots do not block
 	opts            *Options
 	recovery        *subscriberRecovery
 	recoveryEnabled atomic.Bool

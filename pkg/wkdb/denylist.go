@@ -11,6 +11,10 @@ import (
 
 func (wk *wukongDB) AddDenylist(channelId string, channelType uint8, members []Member) error {
 
+	lock := &wk.recoveryChannelLocks[key.ChannelToNum(channelId, channelType)%64]
+	lock.Lock()
+	defer lock.Unlock()
+
 	wk.metrics.AddDenylistAdd(1)
 
 	db := wk.channelDb(channelId, channelType)
@@ -22,13 +26,27 @@ func (wk *wukongDB) AddDenylist(channelId string, channelType uint8, members []M
 
 	w := db.NewIndexedBatch()
 	defer w.Close()
+	added := 0
 	for _, member := range members {
+		_, closer, err := w.Get(key.NewDenylistIndexKey(channelId, channelType, key.TableDenylist.Index.Uid, key.HashWithString(member.Uid)))
+		if closer != nil {
+			closer.Close()
+		}
+		if err == nil {
+			continue
+		}
+		if err != pebble.ErrNotFound {
+			return err
+		}
+		added++
 		member.Id = key.HashWithString(member.Uid)
 		if err := wk.writeDenylist(channelId, channelType, member, w); err != nil {
 			return err
 		}
 	}
-	err = wk.incChannelInfoDenylistCount(channelPrimaryId, len(members), w)
+	if added > 0 {
+		err = wk.incChannelInfoDenylistCount(channelPrimaryId, added, w)
+	}
 	if err != nil {
 		wk.Error("incChannelInfoDenylistCount failed", zap.Error(err))
 		return err
@@ -105,6 +123,10 @@ func (wk *wukongDB) ExistDenylist(channelId string, channelType uint8, uid strin
 
 func (wk *wukongDB) RemoveDenylist(channelId string, channelType uint8, uids []string) error {
 
+	lock := &wk.recoveryChannelLocks[key.ChannelToNum(channelId, channelType)%64]
+	lock.Lock()
+	defer lock.Unlock()
+
 	wk.metrics.RemoveDenylistAdd(1)
 
 	db := wk.channelDb(channelId, channelType)
@@ -129,7 +151,9 @@ func (wk *wukongDB) RemoveDenylist(channelId string, channelType uint8, uids []s
 		}
 	}
 
-	err = wk.incChannelInfoDenylistCount(channelPrimaryId, -len(members), w)
+	if len(members) > 0 {
+		err = wk.incChannelInfoDenylistCount(channelPrimaryId, -len(members), w)
+	}
 	if err != nil {
 		wk.Error("RemoveDenylist: incChannelInfoDenylistCount failed", zap.Error(err))
 		return err
@@ -147,6 +171,10 @@ func (wk *wukongDB) RemoveDenylist(channelId string, channelType uint8, uids []s
 }
 
 func (wk *wukongDB) RemoveAllDenylist(channelId string, channelType uint8) error {
+
+	lock := &wk.recoveryChannelLocks[key.ChannelToNum(channelId, channelType)%64]
+	lock.Lock()
+	defer lock.Unlock()
 
 	wk.metrics.RemoveAllDenylistAdd(1)
 
@@ -210,18 +238,23 @@ func (wk *wukongDB) removeDenylist(channelId string, channelType uint8, member M
 func (wk *wukongDB) getDenylistByUids(channelId string, channelType uint8, uids []string) ([]Member, error) {
 	members := make([]Member, 0, len(uids))
 	db := wk.channelDb(channelId, channelType)
+	seen := make(map[string]bool, len(uids))
 	for _, uid := range uids {
+		if seen[uid] {
+			continue
+		}
+		seen[uid] = true
 		id := key.HashWithString(uid)
 		iter := db.NewIter(&pebble.IterOptions{
 			LowerBound: key.NewDenylistColumnKey(channelId, channelType, id, key.MinColumnKey),
 			UpperBound: key.NewDenylistColumnKey(channelId, channelType, id, key.MaxColumnKey),
 		})
-		defer iter.Close()
 
 		err := wk.iterateDenylist(iter, func(member Member) bool {
 			members = append(members, member)
 			return true
 		})
+		iter.Close()
 		if err != nil {
 			return nil, err
 		}

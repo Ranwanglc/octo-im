@@ -38,10 +38,9 @@ func New() *Server {
 }
 
 func (s *Server) Start() error {
-	if cfg := options.G.SubscriberRecovery; cfg.Enabled {
-		if err := service.Store.StartSubscriberRecovery(store.SubscriberRecoveryConfig{Workers: cfg.Workers, MaxPending: cfg.MaxPending, Interval: cfg.Interval, Timeout: cfg.Timeout}, s.finalizeSubscriberWork); err != nil {
-			return err
-		}
+	cfg := options.G.SubscriberRecovery
+	if err := service.Store.StartSubscriberRecovery(store.SubscriberRecoveryConfig{Workers: cfg.Workers, MaxPending: cfg.MaxPending, Interval: cfg.Interval, Timeout: cfg.Timeout, Paused: !cfg.Enabled}, s.finalizeSubscriberWork); err != nil {
+		return err
 	}
 
 	s.timingWheel.Start()

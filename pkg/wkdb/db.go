@@ -1,6 +1,7 @@
 package wkdb
 
 type DB interface {
+	SlotApplyDB
 	SubscriberRecoveryDB
 	Open() error
 	Close() error
@@ -47,6 +48,7 @@ type DB interface {
 }
 
 type MessageEventDB interface {
+	AppendMessageEventForSlot(slot uint32, index uint64, event *MessageEvent) error
 	// AppendMessageEventWithState applies one event and updates the event key projection state.
 	AppendMessageEventWithState(event *MessageEvent) (*MessageEvent, *MessageEventState, error)
 	// GetMessageEventByEventID finds a projected event view by (channel, client_msg_no, event_id).

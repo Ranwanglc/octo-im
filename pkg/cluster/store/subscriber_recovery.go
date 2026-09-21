@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"sort"
 	"sync"
 	"time"
@@ -19,13 +18,17 @@ var ErrInvalidSubscriberOperation = errors.New("invalid subscriber operation")
 
 var ErrSubscriberConflict = errors.New("operation_id already used for different subscriber input")
 
-const subscriberRecoveryInlinePageSize = 256
+// Foreground requests amortize source checkpoints across a larger page. Each
+// target proposal still obeys MaxConversationEffects and parallelism stays 16.
+const subscriberRecoveryInlinePageSize = 1024
 
 type SubscriberRecoveryConfig struct {
 	Workers    int
 	MaxPending uint64
 	Interval   time.Duration
 	Timeout    time.Duration
+	// Paused stops background recovery, not normal versioned member writes.
+	Paused bool
 }
 
 type SubscriberRecoveryStats struct {
@@ -37,13 +40,14 @@ type SubscriberRecoveryStats struct {
 }
 
 type subscriberRecovery struct {
-	config   SubscriberRecoveryConfig
-	finalize func(context.Context, wkdb.SubscriberWork) error
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	workMu   [64]sync.Mutex
-	mu       sync.Mutex
-	stats    SubscriberRecoveryStats
+	config    SubscriberRecoveryConfig
+	finalize  func(context.Context, wkdb.SubscriberWork) error
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	workMu    sync.Mutex
+	workLocks map[subscriberWorkKey]*subscriberWorkGate
+	mu        sync.Mutex
+	stats     SubscriberRecoveryStats
 }
 
 // StartSubscriberRecovery must be called once, after the API finalizer is wired
@@ -53,14 +57,32 @@ func (s *Store) StartSubscriberRecovery(cfg SubscriberRecoveryConfig, finalize f
 	if s.recovery != nil {
 		return errors.New("subscriber recovery already started")
 	}
-	if cfg.Workers < 1 || cfg.Workers > 2 || cfg.MaxPending < 1 || cfg.Interval < 10*time.Millisecond || cfg.Timeout <= 0 || finalize == nil {
-		return errors.New("invalid subscriber recovery configuration")
+	if cfg.Workers < 1 || cfg.Workers > 2 {
+		return errors.New("subscriberRecovery.workers must be 1 or 2")
+	}
+	if cfg.MaxPending < 1 {
+		return errors.New("subscriberRecovery.maxPending must be positive")
+	}
+	if cfg.Interval < 10*time.Millisecond {
+		return errors.New("subscriberRecovery.interval must be at least 10ms")
+	}
+	if cfg.Timeout <= 0 {
+		return errors.New("subscriberRecovery.timeout must be positive")
+	}
+	if finalize == nil {
+		return errors.New("subscriber recovery finalizer is required")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &subscriberRecovery{config: cfg, finalize: finalize, cancel: cancel, stats: SubscriberRecoveryStats{Workers: cfg.Workers}}
+	r.workLocks = make(map[subscriberWorkKey]*subscriberWorkGate)
 	s.recovery = r
-	s.recoveryEnabled.Store(true)
-	for i := 0; i < cfg.Workers; i++ {
+	s.recoveryEnabled.Store(!cfg.Paused || s.wdb.SubscriberRecoveryActive())
+	if cfg.Paused {
+		r.stats.Workers = 0
+		return nil
+	}
+	r.stats.Workers = min(cfg.Workers, s.wdb.GetShardNum())
+	for i := 0; i < r.stats.Workers; i++ {
 		r.wg.Add(1)
 		go func(worker int) { defer r.wg.Done(); s.runSubscriberRecovery(ctx, worker) }(i)
 	}
@@ -116,7 +138,30 @@ func (s *Store) SubmitSubscriberOperation(ctx context.Context, o wkdb.Subscriber
 		o.ConversationIDs[i] = s.NextPrimaryKey()
 	}
 	if o.Mode == "deny_set" || o.Mode == "deny_remove_all" {
-		o.RestoreConversationIDs = make([]uint64, min(o.MaxPending, uint64(wkdb.MaxSubscriberOperationMembers)))
+		denied, err := s.wdb.GetDenylist(o.ChannelID, o.ChannelType)
+		if err != nil {
+			return wkdb.SubscriberReceipt{}, err
+		}
+		newDeny := make(map[string]bool, len(o.UIDs))
+		if o.Mode == "deny_set" {
+			for _, uid := range o.UIDs {
+				newDeny[uid] = true
+			}
+		}
+		restoreCount := 0
+		for _, member := range denied {
+			if newDeny[member.Uid] {
+				continue
+			}
+			subscribed, err := s.wdb.ExistSubscriber(o.ChannelID, o.ChannelType, member.Uid)
+			if err != nil {
+				return wkdb.SubscriberReceipt{}, err
+			}
+			if subscribed {
+				restoreCount++
+			}
+		}
+		o.RestoreConversationIDs = make([]uint64, restoreCount)
 		for i := range o.RestoreConversationIDs {
 			o.RestoreConversationIDs[i] = s.NextPrimaryKey()
 		}
@@ -137,7 +182,7 @@ func (s *Store) SubmitSubscriberOperation(ctx context.Context, o wkdb.Subscriber
 		if old.Digest != o.Digest() {
 			return old, ErrSubscriberConflict
 		}
-		if old.State != "rejected" || old.Error != "backlog_full" {
+		if old.State != "rejected" || (old.Error != "backlog_full" && old.Error != "restore_set_changed") {
 			return old, nil
 		}
 	}
@@ -171,9 +216,11 @@ func (s *Store) CompleteSubscriberOperation(ctx context.Context, receipt wkdb.Su
 	if receipt.State != "pending" {
 		return receipt, nil
 	}
-	lock := &s.recovery.workMu[subscriberWorkLock(receipt.ChannelID, receipt.ChannelType, receipt.Version)]
-	lock.Lock()
-	defer lock.Unlock()
+	unlock, _, err := s.recovery.lockWork(ctx, subscriberWorkKey{receipt.ChannelID, receipt.ChannelType, receipt.Version}, true)
+	if err != nil {
+		return receipt, err
+	}
+	defer unlock()
 
 	slot := s.opts.Slot.GetSlotId(receipt.ChannelID)
 	for {
@@ -211,16 +258,54 @@ func (s *Store) CompleteSubscriberOperation(ctx context.Context, receipt wkdb.Su
 	}
 }
 
-func subscriberWorkLock(channelID string, channelType uint8, version uint64) uint32 {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(channelID))
-	_, _ = h.Write([]byte{channelType})
-	var versionBytes [8]byte
-	for i := range versionBytes {
-		versionBytes[len(versionBytes)-1-i] = byte(version >> (8 * i))
+type subscriberWorkKey struct {
+	channel string
+	typeID  uint8
+	version uint64
+}
+type subscriberWorkGate struct {
+	token chan struct{}
+	refs  int
+}
+
+// Only competing attempts of the SAME operation wait for one another. Ref
+// counting includes waiters, so locks are reclaimed without a split-lock race.
+func (r *subscriberRecovery) lockWork(ctx context.Context, key subscriberWorkKey, wait bool) (func(), bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
 	}
-	_, _ = h.Write(versionBytes[:])
-	return h.Sum32() % 64
+	r.workMu.Lock()
+	gate := r.workLocks[key]
+	if gate == nil {
+		gate = &subscriberWorkGate{token: make(chan struct{}, 1)}
+		r.workLocks[key] = gate
+	}
+	gate.refs++
+	r.workMu.Unlock()
+	drop := func() {
+		r.workMu.Lock()
+		gate.refs--
+		if gate.refs == 0 {
+			delete(r.workLocks, key)
+		}
+		r.workMu.Unlock()
+	}
+	if wait {
+		select {
+		case gate.token <- struct{}{}:
+		case <-ctx.Done():
+			drop()
+			return nil, false, ctx.Err()
+		}
+	} else {
+		select {
+		case gate.token <- struct{}{}:
+		default:
+			drop()
+			return nil, false, nil
+		}
+	}
+	return func() { <-gate.token; drop() }, true, nil
 }
 
 func (s *Store) proposeRecovery(ctx context.Context, slot uint32, tp CMDType, v any) error {
@@ -241,40 +326,49 @@ func (s *Store) proposeRecovery(ctx context.Context, slot uint32, tp CMDType, v 
 
 func (s *Store) applySubscriberRecovery(slot uint32, cmd *CMD, index uint64) error {
 	if len(cmd.Data) > wkdb.MaxSubscriberOperationBytes*8 {
-		return errors.New("recovery command too large")
+		return &PermanentApplyError{errors.New("recovery command too large")}
 	}
 	switch cmd.CmdType {
 	case CMDSubscriberOperation:
 		var o wkdb.SubscriberOperation
 		if err := json.Unmarshal(cmd.Data, &o); err != nil {
-			return err
+			return &PermanentApplyError{err}
 		}
 		if s.opts.Slot.GetSlotId(o.ChannelID) != slot {
-			return errors.New("subscriber operation routed to wrong slot")
+			return &PermanentApplyError{errors.New("subscriber operation routed to wrong slot")}
+		}
+		if err := o.Validate(); err != nil {
+			return &PermanentApplyError{err}
 		}
 		return s.wdb.ApplySubscriberOperation(slot, index, o)
 	case CMDConversationEffects:
 		var effects []wkdb.ConversationEffect
 		if err := json.Unmarshal(cmd.Data, &effects); err != nil {
-			return err
+			return &PermanentApplyError{err}
+		}
+		if len(effects) == 0 || len(effects) > wkdb.MaxConversationEffects {
+			return &PermanentApplyError{errors.New("invalid conversation effect page")}
 		}
 		for _, e := range effects {
+			if e.UID == "" || e.ChannelID == "" || e.ChannelType == 0 || e.Version == 0 || (!e.Deleted && e.ConversationID == 0) || e.CreatedAt <= 0 {
+				return &PermanentApplyError{errors.New("invalid conversation effect")}
+			}
 			if s.opts.Slot.GetSlotId(e.UID) != slot {
-				return errors.New("conversation effect routed to wrong slot")
+				return &PermanentApplyError{errors.New("conversation effect routed to wrong slot")}
 			}
 		}
 		return s.wdb.ApplyConversationEffects(effects)
 	case CMDSubscriberCheckpoint:
 		var c wkdb.SubscriberCheckpoint
 		if err := json.Unmarshal(cmd.Data, &c); err != nil {
-			return err
+			return &PermanentApplyError{err}
 		}
 		if c.SlotID != slot || s.opts.Slot.GetSlotId(c.ChannelID) != slot {
-			return errors.New("subscriber checkpoint routed to wrong slot")
+			return &PermanentApplyError{errors.New("subscriber checkpoint routed to wrong slot")}
 		}
 		return s.wdb.CheckpointSubscriberWork(c)
 	}
-	return errors.New("unknown recovery command")
+	return &PermanentApplyError{errors.New("unknown recovery command")}
 }
 
 func (s *Store) runSubscriberRecovery(ctx context.Context, worker int) {
@@ -313,8 +407,11 @@ func (s *Store) runSubscriberRecovery(ctx context.Context, worker int) {
 		}
 		shard += r.config.Workers
 		if err == nil && len(work) > 0 && work[0].NextAttempt <= time.Now().UnixNano() && s.opts.Slot.SlotLeaderId(work[0].SlotID) == s.opts.NodeId {
-			lock := &r.workMu[subscriberWorkLock(work[0].Operation.ChannelID, work[0].Operation.ChannelType, work[0].Version)]
-			lock.Lock()
+			// Never park a bounded worker behind a request or another work item.
+			unlock, acquired, _ := r.lockWork(ctx, subscriberWorkKey{work[0].Operation.ChannelID, work[0].Operation.ChannelType, work[0].Version}, false)
+			if !acquired {
+				continue
+			}
 			current, found, getErr := s.wdb.GetSubscriberWork(work[0].Operation.ChannelID, work[0].Operation.ChannelType, work[0].SlotID, work[0].Version)
 			if getErr != nil {
 				err = getErr
@@ -325,7 +422,7 @@ func (s *Store) runSubscriberRecovery(ctx context.Context, worker int) {
 				err = s.processSubscriberWork(opCtx, current)
 				cancel()
 			}
-			lock.Unlock()
+			unlock()
 			if err != nil && ctx.Err() == nil {
 				w := work[0]
 				// Persist retry scheduling so failover/restart cannot create a retry storm.
@@ -335,8 +432,11 @@ func (s *Store) runSubscriberRecovery(ctx context.Context, worker int) {
 				if len(message) > 512 {
 					message = message[:512]
 				}
-				_ = s.proposeRecovery(retryCtx, w.SlotID, CMDSubscriberCheckpoint, wkdb.SubscriberCheckpoint{SlotID: w.SlotID, ChannelID: w.Operation.ChannelID, ChannelType: w.Operation.ChannelType, OperationID: w.Operation.OperationID, Version: w.Version, Previous: w.Next, Next: w.Next, RetryAt: time.Now().Add(wait).UnixNano(), Error: message})
+				checkpointErr := s.proposeRecovery(retryCtx, w.SlotID, CMDSubscriberCheckpoint, wkdb.SubscriberCheckpoint{SlotID: w.SlotID, ChannelID: w.Operation.ChannelID, ChannelType: w.Operation.ChannelType, OperationID: w.Operation.OperationID, Version: w.Version, Previous: w.Next, Next: w.Next, RetryAt: time.Now().Add(wait).UnixNano(), Error: message})
 				retryCancel()
+				if checkpointErr != nil {
+					err = errors.Join(err, fmt.Errorf("persist subscriber retry: %w", checkpointErr))
+				}
 			}
 			if err == nil {
 				r.mu.Lock()
@@ -390,8 +490,11 @@ func (s *Store) processSubscriberWorkPage(ctx context.Context, w wkdb.Subscriber
 	for slot, effects := range bySlot {
 		slot, effects := slot, effects
 		g.Go(func() error {
-			if err := s.proposeRecovery(groupCtx, slot, CMDConversationEffects, effects); err != nil {
-				return fmt.Errorf("subscriber target slot %d: %w", slot, err)
+			for start := 0; start < len(effects); start += wkdb.MaxConversationEffects {
+				page := effects[start:min(start+wkdb.MaxConversationEffects, len(effects))]
+				if err := s.proposeRecovery(groupCtx, slot, CMDConversationEffects, page); err != nil {
+					return fmt.Errorf("subscriber target slot %d: %w", slot, err)
+				}
 			}
 			return nil
 		})

@@ -305,3 +305,121 @@ func TestSubscriberRecoveryApplyLogOrderAndRouting(t *testing.T) {
 	require.NoError(t, err)
 	require.Error(t, s.applySubscriberRecovery((slot+1)%8, NewCMD(CMDConversationEffects, b), 13))
 }
+
+func TestRecoveryInlineChunksSkewedSlot(t *testing.T) {
+	s, slots := recoveryStore(t)
+	cfg := recoveryConfig()
+	cfg.MaxPending = 1024
+	cfg.Interval = time.Hour
+	require.NoError(t, s.StartSubscriberRecovery(cfg, func(context.Context, wkdb.SubscriberWork) error { return nil }))
+	var uids []string
+	for i := 0; len(uids) < 129; i++ {
+		u := fmt.Sprintf("u%06d", i)
+		if slots.GetSlotId(u) == 0 {
+			uids = append(uids, u)
+		}
+	}
+	r, err := s.SubmitSubscriberOperation(context.Background(), wkdb.SubscriberOperation{OperationID: "skew", ChannelID: "g", ChannelType: 2, Mode: "add", UIDs: uids})
+	require.NoError(t, err)
+	r, err = s.CompleteSubscriberOperation(context.Background(), r)
+	require.NoError(t, err)
+	require.Equal(t, "complete", r.State)
+	require.Equal(t, 129, r.Completed)
+}
+
+func TestRecoveryPausedStillCompletesNewMembership(t *testing.T) {
+	s, _ := recoveryStore(t)
+	cfg := recoveryConfig()
+	cfg.Paused = true
+	require.NoError(t, s.StartSubscriberRecovery(cfg, func(context.Context, wkdb.SubscriberWork) error { return nil }))
+	for _, mode := range []string{"add", "remove", "add"} {
+		r, err := s.SubmitSubscriberOperation(context.Background(), wkdb.SubscriberOperation{ChannelID: "g", ChannelType: 2, Mode: mode, UIDs: []string{"a"}})
+		require.NoError(t, err)
+		r, err = s.CompleteSubscriberOperation(context.Background(), r)
+		require.NoError(t, err)
+		require.Equal(t, "complete", r.State)
+	}
+	_, err := s.DB().GetConversation("a", "g", 2)
+	require.NoError(t, err)
+	require.Zero(t, s.SubscriberRecoveryStats().Workers)
+	require.Zero(t, s.SubscriberRecoveryStats().Pages)
+}
+
+func TestRecoveryRequestLockHonorsCancellation(t *testing.T) {
+	s, _ := recoveryStore(t)
+	cfg := recoveryConfig()
+	cfg.Paused = true
+	require.NoError(t, s.StartSubscriberRecovery(cfg, func(context.Context, wkdb.SubscriberWork) error { return nil }))
+	r, err := s.SubmitSubscriberOperation(context.Background(), wkdb.SubscriberOperation{ChannelID: "g", ChannelType: 2, Mode: "add", UIDs: []string{"a"}})
+	require.NoError(t, err)
+	unlock, acquired, err := s.recovery.lockWork(context.Background(), subscriberWorkKey{r.ChannelID, r.ChannelType, r.Version}, true)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	defer unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = s.CompleteSubscriberOperation(ctx, r)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestRecoveryLocksOnlyBlockSameOperationAndAreReclaimed(t *testing.T) {
+	r := &subscriberRecovery{workLocks: make(map[subscriberWorkKey]*subscriberWorkGate)}
+	ctx := context.Background()
+	key := subscriberWorkKey{"g", 2, 1}
+	first, ok, err := r.lockWork(ctx, key, true)
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, ok, err = r.lockWork(ctx, key, false)
+	require.NoError(t, err)
+	require.False(t, ok)
+	other, ok, err := r.lockWork(ctx, subscriberWorkKey{"g", 2, 2}, false)
+	require.NoError(t, err)
+	require.True(t, ok)
+	other()
+	first()
+	require.Empty(t, r.workLocks)
+}
+
+func TestRecoveryPausedAfterRestartFencesOldPendingWork(t *testing.T) {
+	dir := t.TempDir()
+	open := func() (*Store, *recoverySlots) {
+		db := wkdb.NewWukongDB(wkdb.NewOptions(wkdb.WithDir(dir), wkdb.WithNodeId(1), wkdb.WithShardNum(2), wkdb.WithMemTableSize(1<<20)))
+		require.NoError(t, db.Open())
+		slots := &recoverySlots{}
+		slots.leader.Store(1)
+		for i := range slots.indexes {
+			index, err := db.SlotAppliedIndex(uint32(i))
+			require.NoError(t, err)
+			slots.indexes[i] = index
+		}
+		s := New(NewOptions(WithNodeId(1), WithDB(db), WithSlot(slots)))
+		slots.store = s
+		return s, slots
+	}
+	s, slots := open()
+	cfg := recoveryConfig()
+	cfg.Interval = time.Hour
+	finalize := func(context.Context, wkdb.SubscriberWork) error { return nil }
+	require.NoError(t, s.StartSubscriberRecovery(cfg, finalize))
+	old, err := s.SubmitSubscriberOperation(context.Background(), wkdb.SubscriberOperation{OperationID: "old", ChannelID: "g", ChannelType: 2, Mode: "add", UIDs: []string{"a"}})
+	require.NoError(t, err)
+	work, found, err := s.DB().GetSubscriberWork("g", 2, slots.GetSlotId("g"), old.Version)
+	require.NoError(t, err)
+	require.True(t, found)
+	s.Stop()
+	require.NoError(t, s.DB().Close())
+	s, _ = open()
+	defer func() { s.Stop(); require.NoError(t, s.DB().Close()) }()
+	cfg.Paused = true
+	require.NoError(t, s.StartSubscriberRecovery(cfg, finalize))
+	require.True(t, s.DB().SubscriberRecoveryActive())
+	removed, err := s.SubmitSubscriberOperation(context.Background(), wkdb.SubscriberOperation{OperationID: "remove", ChannelID: "g", ChannelType: 2, Mode: "remove", UIDs: []string{"a"}})
+	require.NoError(t, err)
+	removed, err = s.CompleteSubscriberOperation(context.Background(), removed)
+	require.NoError(t, err)
+	require.Equal(t, "complete", removed.State)
+	require.NoError(t, s.DB().ApplyConversationEffects(work.Effects), "delayed old add must be harmless")
+	_, err = s.DB().GetConversation("a", "g", 2)
+	require.ErrorIs(t, err, wkdb.ErrNotFound)
+	require.Zero(t, s.SubscriberRecoveryStats().Workers)
+}

@@ -93,7 +93,7 @@ func (ch *channel) channelCreateOrUpdate(c *wkhttp.Context) {
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
 		return
 	}
-	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+	if (options.G.SubscriberRecovery.Enabled || service.Store.DB().SubscriberRecoveryActive()) && req.ChannelType != wkproto.ChannelTypePerson {
 		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelID, ChannelType: req.ChannelType, Mode: recoveryAddMode(req.Reset), UIDs: req.Subscribers, Channel: func() *wkdb.ChannelInfo { v := req.ToChannelInfo(); return &v }()})
 		return
 	}
@@ -193,7 +193,7 @@ func (ch *channel) addSubscriber(c *wkhttp.Context) {
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
 		return
 	}
-	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+	if (options.G.SubscriberRecovery.Enabled || service.Store.DB().SubscriberRecoveryActive()) && req.ChannelType != wkproto.ChannelTypePerson {
 		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelId, ChannelType: req.ChannelType, Mode: recoveryAddMode(req.Reset), UIDs: req.Subscribers, Channel: nil})
 		return
 	}
@@ -474,7 +474,7 @@ func (ch *channel) removeSubscriber(c *wkhttp.Context) {
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
 		return
 	}
-	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+	if (options.G.SubscriberRecovery.Enabled || service.Store.DB().SubscriberRecoveryActive()) && req.ChannelType != wkproto.ChannelTypePerson {
 		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelId, ChannelType: req.ChannelType, Mode: "remove", UIDs: req.Subscribers, Channel: nil})
 		return
 	}
@@ -544,7 +544,7 @@ func (ch *channel) removeAllSubscriber(c *wkhttp.Context) {
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
 		return
 	}
-	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+	if (options.G.SubscriberRecovery.Enabled || service.Store.DB().SubscriberRecoveryActive()) && req.ChannelType != wkproto.ChannelTypePerson {
 		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelId, ChannelType: req.ChannelType, Mode: "remove_all", UIDs: nil, Channel: nil})
 		return
 	}
@@ -637,7 +637,7 @@ func (ch *channel) blacklistAdd(c *wkhttp.Context) {
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
 		return
 	}
-	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+	if (options.G.SubscriberRecovery.Enabled || service.Store.DB().SubscriberRecoveryActive()) && req.ChannelType != wkproto.ChannelTypePerson {
 		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelId, ChannelType: req.ChannelType, Mode: "deny_add", UIDs: req.UIDs, Channel: nil})
 		return
 	}
@@ -706,7 +706,7 @@ func (ch *channel) blacklistSet(c *wkhttp.Context) {
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
 		return
 	}
-	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+	if (options.G.SubscriberRecovery.Enabled || service.Store.DB().SubscriberRecoveryActive()) && req.ChannelType != wkproto.ChannelTypePerson {
 		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelId, ChannelType: req.ChannelType, Mode: "deny_set", UIDs: req.UIDs, Channel: nil})
 		return
 	}
@@ -785,7 +785,7 @@ func (ch *channel) blacklistRemove(c *wkhttp.Context) {
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
 		return
 	}
-	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+	if (options.G.SubscriberRecovery.Enabled || service.Store.DB().SubscriberRecoveryActive()) && req.ChannelType != wkproto.ChannelTypePerson {
 		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelId, ChannelType: req.ChannelType, Mode: "deny_remove", UIDs: req.UIDs, Channel: nil})
 		return
 	}
@@ -849,7 +849,7 @@ func (ch *channel) blacklistRemoveAll(c *wkhttp.Context) {
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
 		return
 	}
-	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+	if (options.G.SubscriberRecovery.Enabled || service.Store.DB().SubscriberRecoveryActive()) && req.ChannelType != wkproto.ChannelTypePerson {
 		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelId, ChannelType: req.ChannelType, Mode: "deny_remove_all", UIDs: nil, Channel: nil})
 		return
 	}
@@ -888,7 +888,7 @@ func (ch *channel) channelDelete(c *wkhttp.Context) {
 		c.ForwardWithBody(fmt.Sprintf("%s%s", leaderInfo.ApiServerAddr, c.Request.URL.Path), bodyBytes)
 		return
 	}
-	if options.G.SubscriberRecovery.Enabled && req.ChannelType != wkproto.ChannelTypePerson {
+	if (options.G.SubscriberRecovery.Enabled || service.Store.DB().SubscriberRecoveryActive()) && req.ChannelType != wkproto.ChannelTypePerson {
 		ch.submitSubscriberRecovery(c, wkdb.SubscriberOperation{OperationID: req.OperationID, ChannelID: req.ChannelId, ChannelType: req.ChannelType, Mode: "disband", UIDs: nil, Channel: nil})
 		return
 	}

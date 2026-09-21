@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	// Limits bound one replicated command, including reset's previous members.
-	MaxSubscriberOperationMembers = 4096
+	// Bound the wire payload, not the size of an existing channel.
+	MaxSubscriberOperationMembers = MaxSubscriberOperationBytes / 3
 	MaxSubscriberOperationBytes   = 1 << 20
 	// Dedicated namespace; these records must survive normal channel deletion.
 	subscriberRecoveryTable byte = 0x30
@@ -29,7 +29,12 @@ const (
 	recoveryLifecycle       byte = 4
 	recoveryCounter         byte = 5
 	recoveryApplied         byte = 6
+	recoveryReceiptExpiry   byte = 9
 )
+
+// Completed/rejected operation IDs have a seven-day idempotency window.
+// Pending work and lifecycle fences are never expired by this policy.
+const SubscriberReceiptRetention = 7 * 24 * time.Hour
 
 // SubscriberOperation is an immutable request. IDs and timestamps are selected
 // before replication; retries reuse OperationID, not a newly generated intent.
@@ -142,6 +147,7 @@ type ConversationEffect struct {
 
 // SubscriberWork is source-owned and durably checkpointed after each bounded page.
 type SubscriberWork struct {
+	LastRetryAt int64                `json:"last_retry_at,omitempty"`
 	Attempts    uint32               `json:"attempts"`
 	NextAttempt int64                `json:"next_attempt,omitempty"`
 	SlotID      uint32               `json:"slot_id"`
@@ -226,16 +232,31 @@ func recoverySet(w pebble.Writer, k []byte, v any) error {
 }
 
 // stageRecoveryBatch preserves the already reduced delete-before-insert order.
+// Callers hold the source channel or target user lock. These ranges contain one
+// small record, so enumerate its actual columns (including unknown columns)
+// rather than creating thousands of range tombstones during membership churn.
 // It is never used to regroup an arbitrary sequence of Raft commands.
-func stageRecoveryBatch(dst *pebble.Batch, src *Batch) error {
+func stageRecoveryBatch(db *pebble.DB, dst *pebble.Batch, src *Batch) error {
 	for _, kv := range src.delKvs {
 		if e := dst.Delete(kv.key, pebble.NoSync); e != nil {
 			return e
 		}
 	}
 	for _, kv := range src.delRangeKvs {
-		if e := dst.DeleteRange(kv.key, kv.val, pebble.NoSync); e != nil {
-			return e
+		it := db.NewIter(&pebble.IterOptions{LowerBound: kv.key, UpperBound: kv.val})
+		for it.First(); it.Valid(); it.Next() {
+			if err := dst.Delete(it.Key(), pebble.NoSync); err != nil {
+				it.Close()
+				return err
+			}
+		}
+		err := it.Error()
+		closeErr := it.Close()
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
 		}
 	}
 	for _, kv := range src.setKvs {
@@ -255,7 +276,18 @@ func (wk *wukongDB) GetSubscriberReceipt(ch string, tp uint8, id string) (Subscr
 	stored.Digest = stored.RequestDigest
 	return stored.SubscriberReceipt, ok, e
 }
-func storeSubscriberReceipt(w pebble.Writer, r SubscriberReceipt) error {
+func storeSubscriberReceipt(w pebble.Writer, slot uint32, r SubscriberReceipt) error {
+	if r.State == "complete" || r.State == "rejected" {
+		at := r.CompletedAt
+		if at == 0 {
+			at = r.CreatedAt
+		}
+		k := binary.BigEndian.AppendUint64(recoverySlotKey(recoveryReceiptExpiry, slot), uint64(at))
+		k = binary.BigEndian.AppendUint64(k, r.Version)
+		if err := recoverySet(w, k, r); err != nil {
+			return err
+		}
+	}
 	return recoverySet(w, recoveryChannelKey(recoveryReceipt, r.ChannelID, r.ChannelType, r.OperationID), struct {
 		SubscriberReceipt
 		RequestDigest string `json:"request_digest"`
@@ -273,8 +305,9 @@ func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o Subs
 		return errors.New("zero subscriber operation version")
 	}
 	wk.recoveryActive.Store(true)
-	wk.subscriberRecoveryMu.Lock()
-	defer wk.subscriberRecoveryMu.Unlock()
+	partitionLock := &wk.subscriberRecoveryMu[wk.GetChannelShardIndex(o.ChannelID, o.ChannelType)]
+	partitionLock.Lock()
+	defer partitionLock.Unlock()
 	channelLock := &wk.recoveryChannelLocks[key.ChannelToNum(o.ChannelID, o.ChannelType)%64]
 	channelLock.Lock()
 	defer channelLock.Unlock()
@@ -288,6 +321,9 @@ func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o Subs
 	}
 	batch := db.NewIndexedBatch()
 	defer batch.Close()
+	if e := wk.pruneSubscriberReceipts(db, batch, slot, o.CreatedAt); e != nil {
+		return e
+	}
 	finish := func() error {
 		if e := recoverySet(batch, recoverySlotKey(recoveryApplied, slot), version); e != nil {
 			return e
@@ -298,14 +334,14 @@ func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o Subs
 	if e != nil {
 		return e
 	}
-	if found && (old.State != "rejected" || old.Error != "backlog_full" || old.Digest != o.Digest()) {
+	if found && (old.State != "rejected" || (old.Error != "backlog_full" && old.Error != "restore_set_changed") || old.Digest != o.Digest()) {
 		return finish()
 	}
 	r := SubscriberReceipt{OperationID: o.OperationID, ChannelID: o.ChannelID, ChannelType: o.ChannelType, Digest: o.Digest(), Version: version, State: "pending", CreatedAt: o.CreatedAt}
 	reject := func(reason string) error {
 		r.State = "rejected"
 		r.Error = reason
-		if e := storeSubscriberReceipt(batch, r); e != nil {
+		if e := storeSubscriberReceipt(batch, slot, r); e != nil {
 			return e
 		}
 		return finish()
@@ -328,9 +364,6 @@ func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o Subs
 		members, e := wk.recoverySubscribers(o.ChannelID, o.ChannelType)
 		if e != nil {
 			return e
-		}
-		if len(members) > MaxSubscriberOperationMembers {
-			return reject("too_many_members")
 		}
 		for _, m := range members {
 			removes = append(removes, m.Uid)
@@ -361,9 +394,6 @@ func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o Subs
 		if e != nil {
 			return e
 		}
-		if len(denied) > MaxSubscriberOperationMembers {
-			return reject("too_many_members")
-		}
 		newDeny := make(map[string]bool)
 		if o.Mode == "deny_set" {
 			for _, uid := range o.UIDs {
@@ -390,7 +420,7 @@ func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o Subs
 			id := inputIDs[m.Uid]
 			if id == 0 {
 				if restoreIndex >= len(o.RestoreConversationIDs) {
-					return reject("backlog_full")
+					return reject("restore_set_changed")
 				}
 				id = o.RestoreConversationIDs[restoreIndex]
 				restoreIndex++
@@ -412,9 +442,6 @@ func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o Subs
 		uids = append(uids, uid)
 	}
 	sort.Strings(uids)
-	if len(uids) > MaxSubscriberOperationMembers {
-		return reject("too_many_members")
-	}
 	for _, uid := range uids {
 		if uid == "" || len(uid) > 1024 {
 			return reject("invalid_existing_member")
@@ -425,7 +452,12 @@ func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o Subs
 		return e
 	}
 	weight := uint64(len(uids) + 1) // also charge operations with only tag work
-	if weight > o.MaxPending || pending > o.MaxPending-weight {
+	if o.ChannelType == wkproto.ChannelTypeLive {
+		weight = 1
+	}
+	// An otherwise idle partition admits one oversized operation. Its durable
+	// tail applies backpressure until drained; maxPending is not a group-size limit.
+	if pending > 0 && (pending >= o.MaxPending || weight > o.MaxPending-pending) {
 		return reject("backlog_full")
 	}
 	work := SubscriberWork{SlotID: slot, Operation: o, Version: version}
@@ -469,7 +501,7 @@ func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o Subs
 			}
 		}
 	}
-	if e := stageRecoveryBatch(batch, staged); e != nil {
+	if e := stageRecoveryBatch(db, batch, staged); e != nil {
 		return e
 	}
 	if o.Mode == "deny_add" || o.Mode == "deny_set" || o.Mode == "deny_remove" || o.Mode == "deny_remove_all" {
@@ -504,7 +536,7 @@ func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o Subs
 		}
 	}
 	r.Total = len(work.Effects)
-	if e := storeSubscriberReceipt(batch, r); e != nil {
+	if e := storeSubscriberReceipt(batch, slot, r); e != nil {
 		return e
 	}
 	if e := recoverySet(batch, recoveryPendingKey(slot, version), work); e != nil {
@@ -523,12 +555,12 @@ func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o Subs
 	return nil
 }
 
-// recoverySubscribers bounds reset enumeration before applying any changes.
+// Capture previous members before the atomic source mutation. Target work is paged.
 func (wk *wukongDB) recoverySubscribers(ch string, tp uint8) ([]Member, error) {
 	iter := wk.channelDb(ch, tp).NewIter(&pebble.IterOptions{LowerBound: key.NewSubscriberColumnKey(ch, tp, 0, key.MinColumnKey), UpperBound: key.NewSubscriberColumnKey(ch, tp, ^uint64(0), key.MaxColumnKey)})
 	defer iter.Close()
 	var result []Member
-	e := wk.iterateSubscriber(iter, func(m Member) bool { result = append(result, m); return len(result) <= MaxSubscriberOperationMembers })
+	e := wk.iterateSubscriber(iter, func(m Member) bool { result = append(result, m); return true })
 	if e != nil {
 		return nil, e
 	}
@@ -539,7 +571,7 @@ func (wk *wukongDB) recoveryDenylist(ch string, tp uint8) ([]Member, error) {
 	iter := wk.channelDb(ch, tp).NewIter(&pebble.IterOptions{LowerBound: key.NewDenylistPrimaryKey(ch, tp, 0), UpperBound: key.NewDenylistPrimaryKey(ch, tp, ^uint64(0))})
 	defer iter.Close()
 	var result []Member
-	err := wk.iterateDenylist(iter, func(m Member) bool { result = append(result, m); return len(result) <= MaxSubscriberOperationMembers })
+	err := wk.iterateDenylist(iter, func(m Member) bool { result = append(result, m); return true })
 	if err != nil {
 		return nil, err
 	}
@@ -547,7 +579,10 @@ func (wk *wukongDB) recoveryDenylist(ch string, tp uint8) ([]Member, error) {
 }
 
 func (wk *wukongDB) stageRecoveryDenylist(batch *pebble.Batch, o SubscriberOperation, at time.Time) error {
-	pk, _ := wk.getChannelPrimaryKey(o.ChannelID, o.ChannelType)
+	pk, err := wk.getChannelPrimaryKey(o.ChannelID, o.ChannelType)
+	if err != nil {
+		return err
+	}
 	existing, e := wk.getDenylistByUids(o.ChannelID, o.ChannelType, o.UIDs)
 	if e != nil {
 		return e
@@ -628,8 +663,9 @@ func (wk *wukongDB) ListSubscriberWork(shard int, after []byte, limit int) ([]Su
 
 // CheckpointSubscriberWork is a compare-and-set over the exact source progress.
 func (wk *wukongDB) CheckpointSubscriberWork(c SubscriberCheckpoint) error {
-	wk.subscriberRecoveryMu.Lock()
-	defer wk.subscriberRecoveryMu.Unlock()
+	partitionLock := &wk.subscriberRecoveryMu[wk.GetChannelShardIndex(c.ChannelID, c.ChannelType)]
+	partitionLock.Lock()
+	defer partitionLock.Unlock()
 	db := wk.channelDb(c.ChannelID, c.ChannelType)
 	var w SubscriberWork
 	ok, e := recoveryRead(db, recoveryPendingKey(c.SlotID, c.Version), &w)
@@ -638,6 +674,9 @@ func (wk *wukongDB) CheckpointSubscriberWork(c SubscriberCheckpoint) error {
 	}
 	if w.Operation.OperationID != c.OperationID || w.Operation.ChannelID != c.ChannelID || w.Operation.ChannelType != c.ChannelType {
 		return errors.New("recovery checkpoint identity mismatch")
+	}
+	if c.RetryAt > 0 && c.RetryAt <= w.LastRetryAt {
+		return nil
 	}
 	if c.Previous != w.Next {
 		return nil
@@ -665,6 +704,7 @@ func (wk *wukongDB) CheckpointSubscriberWork(c SubscriberCheckpoint) error {
 		if c.Next != c.Previous || c.Done {
 			return errors.New("retry must not advance recovery work")
 		}
+		w.LastRetryAt = c.RetryAt
 		w.Attempts++
 		w.NextAttempt = c.RetryAt
 		r.Attempts = w.Attempts
@@ -692,10 +732,45 @@ func (wk *wukongDB) CheckpointSubscriberWork(c SubscriberCheckpoint) error {
 	if e := recoverySet(batch, recoverySlotKey(recoveryCounter, c.SlotID), count-decrement); e != nil {
 		return e
 	}
-	if e := storeSubscriberReceipt(batch, r); e != nil {
+	if e := storeSubscriberReceipt(batch, c.SlotID, r); e != nil {
 		return e
 	}
 	return batch.Commit(wk.sync)
+}
+
+// Cleanup uses the replicated operation timestamp, never a follower's clock.
+// Every admission removes at most 64 expired rows in this slot/partition. At
+// steady traffic this bounds receipts by the retention window; idle partitions
+// keep a finite tail until their next write. Old expiry indexes cannot delete a
+// newer reuse of the same operation ID.
+func (wk *wukongDB) pruneSubscriberReceipts(db *pebble.DB, batch *pebble.Batch, slot uint32, now int64) error {
+	before := now - int64(SubscriberReceiptRetention)
+	if before <= 0 {
+		return nil
+	}
+	prefix := recoverySlotKey(recoveryReceiptExpiry, slot)
+	upper := binary.BigEndian.AppendUint64(bytes.Clone(prefix), uint64(before))
+	it := db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upper})
+	defer it.Close()
+	for valid, n := it.First(), 0; valid && n < 64; valid, n = it.Next(), n+1 {
+		var expired SubscriberReceipt
+		if err := json.Unmarshal(it.Value(), &expired); err != nil {
+			return err
+		}
+		current, found, err := wk.GetSubscriberReceipt(expired.ChannelID, expired.ChannelType, expired.OperationID)
+		if err != nil {
+			return err
+		}
+		if found && current.Version == expired.Version && current.State != "pending" {
+			if err := batch.Delete(recoveryChannelKey(recoveryReceipt, expired.ChannelID, expired.ChannelType, expired.OperationID), wk.noSync); err != nil {
+				return err
+			}
+		}
+		if err := batch.Delete(it.Key(), wk.noSync); err != nil {
+			return err
+		}
+	}
+	return it.Error()
 }
 
 // SubscriberBacklogPartition counts outstanding effects plus one finalization

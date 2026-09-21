@@ -23,14 +23,7 @@ func recoveryAddMode(reset int) string {
 
 func (ch *channel) limitSubscriberRequests(next func(*wkhttp.Context)) func(*wkhttp.Context) {
 	return func(c *wkhttp.Context) {
-		if !options.G.SubscriberRecovery.Enabled && service.Store.DB().SubscriberRecoveryActive() {
-			c.JSON(http.StatusServiceUnavailable, map[string]any{
-				"status": http.StatusServiceUnavailable,
-				"msg":    "subscriber recovery is paused; re-enable it before changing channel membership",
-			})
-			return
-		}
-		if options.G.SubscriberRecovery.Enabled {
+		if options.G.SubscriberRecovery.Enabled || service.Store.DB().SubscriberRecoveryActive() {
 			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, wkdb.MaxSubscriberOperationBytes)
 		}
 		next(c)
@@ -72,14 +65,14 @@ func (ch *channel) submitSubscriberRecovery(c *wkhttp.Context, o wkdb.Subscriber
 	}
 	if r.State == "rejected" {
 		status := http.StatusUnprocessableEntity
-		if r.Error == "backlog_full" {
+		if r.Error == "backlog_full" || r.Error == "restore_set_changed" {
 			status = http.StatusTooManyRequests
 			c.Header("Retry-After", "1")
 		}
 		c.JSON(status, map[string]any{"status": status, "msg": r.Error, "data": r})
 		return
 	}
-	completed, err := service.Store.CompleteSubscriberOperation(c.Request.Context(), r)
+	completed, err := service.Store.CompleteSubscriberOperation(ctx, r)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, map[string]any{
 			"status":       http.StatusServiceUnavailable,

@@ -8,13 +8,16 @@ import (
 	"github.com/cockroachdb/pebble"
 )
 
+// Shared wire bound for request-path and background proposals.
+const MaxConversationEffects = 64
+
 func (wk *wukongDB) SubscriberRecoveryActive() bool {
 	return wk.recoveryActive.Load()
 }
 
 // loadSubscriberRecoveryActive preserves lifecycle fencing after a restart.
-// When workers are paused, managed subscriber mutations are rejected while the
-// rest of the service remains available, so queued effects cannot become stale.
+// Pausing workers retains versioned foreground writes, so queued effects cannot
+// bypass membership changes performed while recovery is paused.
 func (wk *wukongDB) loadSubscriberRecoveryActive() error {
 	if wk.SubscriberRecoveryActive() {
 		return nil
@@ -72,9 +75,25 @@ func (wk *wukongDB) lockRecoveryConversations(cs []Conversation) func() {
 	return wk.lockRecoveryUsers(uids)
 }
 
+type lifecycleCacheEntry struct {
+	effect  ConversationEffect
+	found   bool
+	version uint64
+}
+
 func (wk *wukongDB) ConversationLifecycle(uid, ch string, tp uint8) (ConversationEffect, bool, error) {
+	k := recoveryKey(recoveryLifecycle, uid, ch, string([]byte{tp}))
+	version := wk.lifecycleCacheVersion[key.HashWithString(uid)%64].Load()
+	if cached, ok := wk.lifecycleCache.Get(string(k)); ok && cached.version == version {
+		return cached.effect, cached.found, nil
+	}
 	var e ConversationEffect
-	ok, err := recoveryRead(wk.shardDB(uid), recoveryKey(recoveryLifecycle, uid, ch, string([]byte{tp})), &e)
+	ok, err := recoveryRead(wk.shardDB(uid), k, &e)
+	if err == nil {
+		// Tag with the version captured BEFORE the read, so a concurrent commit
+		// cannot be overwritten by a delayed cache fill (including a cached miss).
+		wk.lifecycleCache.Add(string(k), lifecycleCacheEntry{e, ok, version})
+	}
 	return e, ok, err
 }
 
@@ -109,7 +128,7 @@ func (wk *wukongDB) filterRecoveryConversations(cs []Conversation) ([]Conversati
 // lifecycle commit atomically. The reverse relation lives in another physical
 // DB: RelationDone is a durable continuation, retried before acknowledging work.
 func (wk *wukongDB) ApplyConversationEffects(effects []ConversationEffect) error {
-	if len(effects) == 0 || len(effects) > 64 {
+	if len(effects) == 0 || len(effects) > MaxConversationEffects {
 		return errors.New("invalid conversation effect page")
 	}
 	for _, e := range effects {
@@ -188,7 +207,7 @@ func (wk *wukongDB) applyConversationEffect(e ConversationEffect) error {
 		}
 		b := db.NewBatch()
 		defer b.Close()
-		if err := stageRecoveryBatch(b, staged); err != nil {
+		if err := stageRecoveryBatch(db, b, staged); err != nil {
 			return err
 		}
 		e.RelationDone = false
@@ -198,6 +217,7 @@ func (wk *wukongDB) applyConversationEffect(e ConversationEffect) error {
 		if err := b.Commit(wk.sync); err != nil {
 			return err
 		}
+		wk.lifecycleCacheVersion[key.HashWithString(e.UID)%64].Add(1)
 		wk.conversationCache.InvalidateUserConversations(e.UID)
 	}
 	relation := wk.channelDb(e.ChannelID, e.ChannelType).NewBatch()
@@ -220,5 +240,9 @@ func (wk *wukongDB) applyConversationEffect(e ConversationEffect) error {
 	if err := recoverySet(b, lifecycleKey, e); err != nil {
 		return err
 	}
-	return b.Commit(wk.sync)
+	if err := b.Commit(wk.sync); err != nil {
+		return err
+	}
+	wk.lifecycleCacheVersion[key.HashWithString(e.UID)%64].Add(1)
+	return nil
 }
