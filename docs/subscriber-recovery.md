@@ -6,6 +6,12 @@ receipt; already committed work remains durable and can be polled at
 `/channel/subscriber_operation`. Reuse `operation_id` or `Idempotency-Key` when
 retrying a lost response.
 
+Cleanup and denylist requests against a missing channel remain successful
+no-ops, with a completed receipt so retrying after later channel creation cannot
+change that new channel. `/channel/delete` retains its reversible disband flag:
+it preserves subscribers and their conversations. Explicit subscriber removal
+continues to delete the corresponding conversations.
+
 `subscriberRecovery.enabled` defaults to `true`. Setting it to `false` pauses
 background workers. Once lifecycle state exists, foreground membership changes
 continue through the versioned path, including after a restart. Deployments
@@ -13,6 +19,10 @@ which have never activated recovery retain the legacy path while disabled.
 Person channels retain their existing behavior; live channels do not acquire
 recent conversations. Reset, denylist restoration, read positions, and command
 channel tags keep their existing semantics.
+
+`workers` accepts 1 or 2 (capped by database shards); `interval` must be at least
+10ms, and `timeout` and `maxPending` must be positive. Legacy `oldV1Api` migration
+is rejected before API startup when recovery is enabled or has durable state.
 
 `maxPending` defaults to 1024 outstanding effects/finalizations per source
 slot and database partition. An idle partition admits one larger operation,
@@ -47,6 +57,19 @@ batch checkpoint. Blacklist/allowlist mutations are idempotent, and message-even
 projections have an atomic per-slot replay marker. Transient storage failures
 can retry even when workers are paused. Unknown or malformed committed commands
 fail fast rather than being silently skipped or retried indefinitely.
+Persisted recovery invariant failures are classified the same way. Slot apply
+runs through `raftgroup`, whose worker panic handler re-panics and terminates
+the process; it does not use the standalone `raft.Raft` worker pool. Real slot
+integration tests cover transient-fault recovery and process exit on poison
+entries. No failed committed command is silently acknowledged or skipped.
+
+Legacy conversation writes still wait for durable commits before acknowledging
+apply, including `UpdateConversationIfSeqGreaterAsync` (its legacy name is kept
+for API compatibility). Conversation commands stay ordered individually;
+configuration saves retain batching. Reverse relations use the channel shard.
+Writes fenced by deleted or mismatched lifecycle IDs remain rejected, with one
+warning per filtered batch reporting the reasons; arbitrary old IDs are never
+rebound to a new membership generation.
 
 Foreground recovery locks are keyed by operation and reclaimed when no caller
 uses them. Source writes lock their database partition; tag membership reads and

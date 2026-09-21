@@ -6,6 +6,7 @@ import (
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
 	"github.com/cockroachdb/pebble"
+	"go.uber.org/zap"
 )
 
 // Shared wire bound for request-path and background proposals.
@@ -105,8 +106,10 @@ func (wk *wukongDB) filterRecoveryConversations(cs []Conversation) ([]Conversati
 		return cs, nil
 	}
 	filtered := make([]Conversation, 0, len(cs))
+	var missingUID, deleted, mismatchedID int
 	for _, c := range cs {
 		if c.Uid == "" {
+			missingUID++
 			continue
 		}
 		e, ok, err := wk.ConversationLifecycle(c.Uid, c.ChannelId, c.ChannelType)
@@ -114,12 +117,22 @@ func (wk *wukongDB) filterRecoveryConversations(cs []Conversation) ([]Conversati
 			return nil, err
 		}
 		if ok && (e.Deleted || c.Id != e.ConversationID) {
+			if e.Deleted {
+				deleted++
+			} else {
+				mismatchedID++
+			}
 			continue
 		}
 		if ok && c.ReadToMsgSeq < e.ReadToMsgSeq {
 			c.ReadToMsgSeq = e.ReadToMsgSeq
 		}
 		filtered = append(filtered, c)
+	}
+	if missingUID+deleted+mismatchedID > 0 {
+		// Keep old-generation writes fenced; rebinding an arbitrary ID here
+		// could resurrect a stale read position. Make every filtered batch visible.
+		wk.Warn("conversation writes rejected by lifecycle fence", zap.Int("missingUID", missingUID), zap.Int("deleted", deleted), zap.Int("mismatchedID", mismatchedID))
 	}
 	return filtered, nil
 }
@@ -129,11 +142,11 @@ func (wk *wukongDB) filterRecoveryConversations(cs []Conversation) ([]Conversati
 // DB: RelationDone is a durable continuation, retried before acknowledging work.
 func (wk *wukongDB) ApplyConversationEffects(effects []ConversationEffect) error {
 	if len(effects) == 0 || len(effects) > MaxConversationEffects {
-		return errors.New("invalid conversation effect page")
+		return &PermanentApplyError{errors.New("invalid conversation effect page")}
 	}
 	for _, e := range effects {
 		if e.UID == "" || e.ChannelID == "" || e.ChannelType == 0 || e.Version == 0 || (!e.Deleted && e.ConversationID == 0) || e.CreatedAt <= 0 {
-			return errors.New("invalid conversation effect")
+			return &PermanentApplyError{errors.New("invalid conversation effect")}
 		}
 	}
 	wk.recoveryActive.Store(true)
@@ -159,7 +172,7 @@ func (wk *wukongDB) applyConversationEffect(e ConversationEffect) error {
 	}
 	if ok && old.Version == e.Version {
 		if old.Deleted != e.Deleted || old.ConversationID != e.ConversationID {
-			return errors.New("conflicting conversation lifecycle")
+			return &PermanentApplyError{errors.New("conflicting conversation lifecycle")}
 		}
 		if old.RelationDone {
 			return nil

@@ -173,10 +173,7 @@ func (s *Store) applyCMD(cmd *CMD, logIndex uint64) error {
 
 // PermanentApplyError indicates an incompatible or malformed committed entry;
 // retrying it cannot repair the state machine. Storage failures remain retryable.
-type PermanentApplyError struct{ Err error }
-
-func (e *PermanentApplyError) Error() string { return e.Err.Error() }
-func (e *PermanentApplyError) Unwrap() error { return e.Err }
+type PermanentApplyError = wkdb.PermanentApplyError
 
 func (s *Store) applyLog(slot uint32, log types.Log) error {
 	cmd := &CMD{}

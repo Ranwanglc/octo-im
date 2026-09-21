@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"strings"
 	"time"
 
@@ -39,6 +40,11 @@ func New() *Server {
 
 func (s *Server) Start() error {
 	cfg := options.G.SubscriberRecovery
+	// The database has been opened by the cluster by this point. Check durable
+	// activation too, before starting HTTP listeners or any migration writes.
+	if strings.TrimSpace(options.G.OldV1Api) != "" && (cfg.Enabled || service.Store.DB().SubscriberRecoveryActive()) {
+		return errors.New("oldV1Api migration cannot run with enabled or previously activated subscriber recovery")
+	}
 	if err := service.Store.StartSubscriberRecovery(store.SubscriberRecoveryConfig{Workers: cfg.Workers, MaxPending: cfg.MaxPending, Interval: cfg.Interval, Timeout: cfg.Timeout, Paused: !cfg.Enabled}, s.finalizeSubscriberWork); err != nil {
 		return err
 	}

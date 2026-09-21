@@ -109,6 +109,58 @@ func TestCompleteSubscriberOperationDrainsOnRequestPath(t *testing.T) {
 	require.Empty(t, parts)
 }
 
+func TestRecoveryDisbandPreservesMembersAndConversations(t *testing.T) {
+	s, _ := recoveryStore(t)
+	cfg := recoveryConfig()
+	cfg.Interval = time.Hour
+	require.NoError(t, s.StartSubscriberRecovery(cfg, func(context.Context, wkdb.SubscriberWork) error { return nil }))
+	apply := func(o wkdb.SubscriberOperation) wkdb.SubscriberReceipt {
+		r, err := s.SubmitSubscriberOperation(context.Background(), o)
+		require.NoError(t, err)
+		r, err = s.CompleteSubscriberOperation(context.Background(), r)
+		require.NoError(t, err)
+		require.Equal(t, "complete", r.State)
+		return r
+	}
+	apply(wkdb.SubscriberOperation{OperationID: "join", ChannelID: "disband", ChannelType: 2, Mode: "add", UIDs: []string{"u"}, ReadToMsgSeq: 17})
+	before, err := s.DB().GetConversation("u", "disband", 2)
+	require.NoError(t, err)
+	for _, id := range []string{"disband-1", "disband-2"} {
+		r := apply(wkdb.SubscriberOperation{OperationID: id, ChannelID: "disband", ChannelType: 2, Mode: "disband"})
+		require.Zero(t, r.Total, "disband must only update the channel flag and tag")
+		info, err := s.DB().GetChannel("disband", 2)
+		require.NoError(t, err)
+		require.True(t, info.Disband)
+		subscribed, err := s.DB().ExistSubscriber("disband", 2, "u")
+		require.NoError(t, err)
+		require.True(t, subscribed)
+		after, err := s.DB().GetConversation("u", "disband", 2)
+		require.NoError(t, err)
+		require.Equal(t, before, after)
+	}
+}
+
+func TestRecoveryMissingChannelReceiptDoesNotMutateLaterCreation(t *testing.T) {
+	s, _ := recoveryStore(t)
+	cfg := recoveryConfig()
+	cfg.Interval = time.Hour
+	require.NoError(t, s.StartSubscriberRecovery(cfg, func(context.Context, wkdb.SubscriberWork) error { return nil }))
+	o := wkdb.SubscriberOperation{OperationID: "missing-remove", ChannelID: "later", ChannelType: 2, Mode: "remove", UIDs: []string{"u"}}
+	r, err := s.SubmitSubscriberOperation(context.Background(), o)
+	require.NoError(t, err)
+	require.Equal(t, "complete", r.State)
+	joined, err := s.SubmitSubscriberOperation(context.Background(), wkdb.SubscriberOperation{OperationID: "join-later", ChannelID: "later", ChannelType: 2, Mode: "add", UIDs: []string{"u"}})
+	require.NoError(t, err)
+	_, err = s.CompleteSubscriberOperation(context.Background(), joined)
+	require.NoError(t, err)
+	retry, err := s.SubmitSubscriberOperation(context.Background(), o)
+	require.NoError(t, err)
+	require.Equal(t, r.Version, retry.Version)
+	subscribed, err := s.DB().ExistSubscriber("later", 2, "u")
+	require.NoError(t, err)
+	require.True(t, subscribed)
+}
+
 func TestLegacySubscriberMutationsRejectedWhenRecoveryEnabled(t *testing.T) {
 	s := New(NewOptions(WithSubscriberRecoveryEnabled(true)))
 	members := []wkdb.Member{{Uid: "a"}}

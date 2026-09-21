@@ -221,7 +221,10 @@ func recoveryRead(db *pebble.DB, k []byte, out any) (bool, error) {
 		return false, e
 	}
 	defer c.Close()
-	return true, json.Unmarshal(b, out)
+	if e := json.Unmarshal(b, out); e != nil {
+		return true, &PermanentApplyError{fmt.Errorf("decode persisted recovery record: %w", e)}
+	}
+	return true, nil
 }
 func recoverySet(w pebble.Writer, k []byte, v any) error {
 	b, e := json.Marshal(v)
@@ -299,10 +302,10 @@ func storeSubscriberReceipt(w pebble.Writer, slot uint32, r SubscriberReceipt) e
 // not Apply errors that would block replay of committed Raft logs.
 func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o SubscriberOperation) error {
 	if e := o.Validate(); e != nil {
-		return e
+		return &PermanentApplyError{e}
 	}
 	if version == 0 {
-		return errors.New("zero subscriber operation version")
+		return &PermanentApplyError{errors.New("zero subscriber operation version")}
 	}
 	wk.recoveryActive.Store(true)
 	partitionLock := &wk.subscriberRecoveryMu[wk.GetChannelShardIndex(o.ChannelID, o.ChannelType)]
@@ -351,7 +354,15 @@ func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o Subs
 		return e
 	}
 	if IsEmptyChannelInfo(current) && o.Channel == nil && o.Mode != "add" && o.Mode != "reset" {
-		return reject("channel_not_found")
+		// Cleanup of a missing channel was a successful no-op before recovery.
+		// Persist that outcome too, so a lost reply cannot later mutate a newly
+		// created channel when the client retries the same operation ID.
+		r.State = "complete"
+		r.CompletedAt = o.CreatedAt
+		if e := storeSubscriberReceipt(batch, slot, r); e != nil {
+			return e
+		}
+		return finish()
 	}
 	removes := []string(nil)
 	adds := []string(nil)
@@ -360,7 +371,7 @@ func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o Subs
 		adds = o.UIDs
 	case "remove":
 		removes = o.UIDs
-	case "reset", "remove_all", "disband":
+	case "reset", "remove_all":
 		members, e := wk.recoverySubscribers(o.ChannelID, o.ChannelType)
 		if e != nil {
 			return e
@@ -673,7 +684,7 @@ func (wk *wukongDB) CheckpointSubscriberWork(c SubscriberCheckpoint) error {
 		return e
 	}
 	if w.Operation.OperationID != c.OperationID || w.Operation.ChannelID != c.ChannelID || w.Operation.ChannelType != c.ChannelType {
-		return errors.New("recovery checkpoint identity mismatch")
+		return &PermanentApplyError{errors.New("recovery checkpoint identity mismatch")}
 	}
 	if c.RetryAt > 0 && c.RetryAt <= w.LastRetryAt {
 		return nil
@@ -682,14 +693,14 @@ func (wk *wukongDB) CheckpointSubscriberWork(c SubscriberCheckpoint) error {
 		return nil
 	}
 	if c.Next < w.Next || c.Next > len(w.Effects) || (c.Done && c.Next != len(w.Effects)) {
-		return errors.New("invalid recovery progress")
+		return &PermanentApplyError{errors.New("invalid recovery progress")}
 	}
 	r, found, e := wk.GetSubscriberReceipt(c.ChannelID, c.ChannelType, c.OperationID)
 	if e != nil {
 		return e
 	}
 	if !found {
-		return errors.New("missing recovery receipt")
+		return &PermanentApplyError{errors.New("missing recovery receipt")}
 	}
 	var count uint64
 	if _, e := recoveryRead(db, recoverySlotKey(recoveryCounter, c.SlotID), &count); e != nil {
@@ -702,7 +713,7 @@ func (wk *wukongDB) CheckpointSubscriberWork(c SubscriberCheckpoint) error {
 	r.Completed = c.Next
 	if c.RetryAt > 0 {
 		if c.Next != c.Previous || c.Done {
-			return errors.New("retry must not advance recovery work")
+			return &PermanentApplyError{errors.New("retry must not advance recovery work")}
 		}
 		w.LastRetryAt = c.RetryAt
 		w.Attempts++
@@ -727,7 +738,7 @@ func (wk *wukongDB) CheckpointSubscriberWork(c SubscriberCheckpoint) error {
 		return e
 	}
 	if decrement > count {
-		return fmt.Errorf("recovery counter underflow: %d > %d", decrement, count)
+		return &PermanentApplyError{fmt.Errorf("recovery counter underflow: %d > %d", decrement, count)}
 	}
 	if e := recoverySet(batch, recoverySlotKey(recoveryCounter, c.SlotID), count-decrement); e != nil {
 		return e
@@ -755,7 +766,7 @@ func (wk *wukongDB) pruneSubscriberReceipts(db *pebble.DB, batch *pebble.Batch, 
 	for valid, n := it.First(), 0; valid && n < 64; valid, n = it.Next(), n+1 {
 		var expired SubscriberReceipt
 		if err := json.Unmarshal(it.Value(), &expired); err != nil {
-			return err
+			return &PermanentApplyError{fmt.Errorf("decode recovery expiry record: %w", err)}
 		}
 		current, found, err := wk.GetSubscriberReceipt(expired.ChannelID, expired.ChannelType, expired.OperationID)
 		if err != nil {

@@ -145,6 +145,16 @@ func (m *waitBucket) didApply(key string, maxLogIndex uint64) {
 }
 
 func (m *waitBucket) put(progress *progress) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// A failed admission can return a waiter before didApply removes it.
+	// Detach under the notification lock before resetting or pooling it.
+	for i, p := range m.progresses {
+		if p == progress {
+			m.progresses = append(m.progresses[:i], m.progresses[i+1:]...)
+			break
+		}
+	}
 	close(progress.waitC)
 	progress.reset()
 	m.progressPool.Put(progress)
