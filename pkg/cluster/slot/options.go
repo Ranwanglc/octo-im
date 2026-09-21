@@ -23,6 +23,8 @@ type Options struct {
 	RPC icluster.RPC
 	// OnApply 应用日志回调
 	OnApply func(slotId uint32, logs []types.Log) error
+	// ApplyErrorRetry enables tick-paced retries for state-machine apply errors.
+	ApplyErrorRetry bool
 
 	// OnSaveConfig 保存槽配置
 	OnSaveConfig func(slotId uint32, cfg types.Config) error
@@ -81,6 +83,12 @@ func WithSlotCount(slotCount uint32) Option {
 func WithOnApply(onApply func(slotId uint32, logs []types.Log) error) Option {
 	return func(o *Options) {
 		o.OnApply = onApply
+	}
+}
+
+func WithApplyErrorRetry(enabled bool) Option {
+	return func(o *Options) {
+		o.ApplyErrorRetry = enabled
 	}
 }
 

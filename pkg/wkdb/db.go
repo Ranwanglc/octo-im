@@ -1,6 +1,7 @@
 package wkdb
 
 type DB interface {
+	SubscriberRecoveryDB
 	Open() error
 	Close() error
 	// 获取下一个主键
@@ -40,6 +41,9 @@ type DB interface {
 	GetShardNum() int
 	// GetChannelShardIndex 获取频道所在的分片索引
 	GetChannelShardIndex(channelId string, channelType uint8) uint32
+
+	// SubscriberRecoveryActive reports whether lifecycle fencing is required.
+	SubscriberRecoveryActive() bool
 }
 
 type MessageEventDB interface {

@@ -1,0 +1,412 @@
+package store
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hash/fnv"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
+	"golang.org/x/sync/errgroup"
+)
+
+var ErrInvalidSubscriberOperation = errors.New("invalid subscriber operation")
+
+var ErrSubscriberConflict = errors.New("operation_id already used for different subscriber input")
+
+const subscriberRecoveryInlinePageSize = 256
+
+type SubscriberRecoveryConfig struct {
+	Workers    int
+	MaxPending uint64
+	Interval   time.Duration
+	Timeout    time.Duration
+}
+
+type SubscriberRecoveryStats struct {
+	Workers      int    `json:"workers"`
+	Pages        uint64 `json:"pages"`
+	Failures     uint64 `json:"failures"`
+	LastProgress int64  `json:"last_progress,omitempty"`
+	LastError    string `json:"last_error,omitempty"`
+}
+
+type subscriberRecovery struct {
+	config   SubscriberRecoveryConfig
+	finalize func(context.Context, wkdb.SubscriberWork) error
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
+	workMu   [64]sync.Mutex
+	mu       sync.Mutex
+	stats    SubscriberRecoveryStats
+}
+
+// StartSubscriberRecovery must be called once, after the API finalizer is wired
+// and before serving requests. Workers use current source-slot leadership; no
+// in-memory task is required for recovery after restart or leadership transfer.
+func (s *Store) StartSubscriberRecovery(cfg SubscriberRecoveryConfig, finalize func(context.Context, wkdb.SubscriberWork) error) error {
+	if s.recovery != nil {
+		return errors.New("subscriber recovery already started")
+	}
+	if cfg.Workers < 1 || cfg.Workers > 2 || cfg.MaxPending < 1 || cfg.Interval < 10*time.Millisecond || cfg.Timeout <= 0 || finalize == nil {
+		return errors.New("invalid subscriber recovery configuration")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &subscriberRecovery{config: cfg, finalize: finalize, cancel: cancel, stats: SubscriberRecoveryStats{Workers: cfg.Workers}}
+	s.recovery = r
+	s.recoveryEnabled.Store(true)
+	for i := 0; i < cfg.Workers; i++ {
+		r.wg.Add(1)
+		go func(worker int) { defer r.wg.Done(); s.runSubscriberRecovery(ctx, worker) }(i)
+	}
+	return nil
+}
+
+func (s *Store) SubscriberBacklog() ([]wkdb.SubscriberBacklogPartition, error) {
+	parts, err := s.wdb.SubscriberBacklog()
+	if err != nil {
+		return nil, err
+	}
+	owned := parts[:0]
+	for _, p := range parts {
+		if s.opts.Slot.SlotLeaderId(p.SlotID) == s.opts.NodeId {
+			owned = append(owned, p)
+		}
+	}
+	return owned, nil
+}
+
+func (s *Store) SubscriberRecoveryStats() SubscriberRecoveryStats {
+	if s.recovery == nil {
+		return SubscriberRecoveryStats{}
+	}
+	s.recovery.mu.Lock()
+	defer s.recovery.mu.Unlock()
+	return s.recovery.stats
+}
+
+func (s *Store) SubmitSubscriberOperation(ctx context.Context, o wkdb.SubscriberOperation) (wkdb.SubscriberReceipt, error) {
+	if s.recovery == nil {
+		return wkdb.SubscriberReceipt{}, errors.New("subscriber recovery is disabled")
+	}
+	if len(o.UIDs) > wkdb.MaxSubscriberOperationMembers {
+		return wkdb.SubscriberReceipt{}, fmt.Errorf("%w: too many subscribers", ErrInvalidSubscriberOperation)
+	}
+	o.UIDs = append([]string(nil), o.UIDs...)
+	sort.Strings(o.UIDs)
+	unique := o.UIDs[:0]
+	for _, uid := range o.UIDs {
+		if len(unique) == 0 || unique[len(unique)-1] != uid {
+			unique = append(unique, uid)
+		}
+	}
+	o.UIDs = unique
+	if o.OperationID == "" {
+		o.OperationID = wkutil.GenUUID()
+	}
+	o.CreatedAt = time.Now().UnixNano()
+	o.MaxPending = s.recovery.config.MaxPending
+	o.ConversationIDs = make([]uint64, len(o.UIDs))
+	for i := range o.UIDs {
+		o.ConversationIDs[i] = s.NextPrimaryKey()
+	}
+	if o.Mode == "deny_set" || o.Mode == "deny_remove_all" {
+		o.RestoreConversationIDs = make([]uint64, min(o.MaxPending, uint64(wkdb.MaxSubscriberOperationMembers)))
+		for i := range o.RestoreConversationIDs {
+			o.RestoreConversationIDs[i] = s.NextPrimaryKey()
+		}
+	}
+	if err := o.Validate(); err != nil {
+		return wkdb.SubscriberReceipt{}, fmt.Errorf("%w: %v", ErrInvalidSubscriberOperation, err)
+	}
+	slot := s.opts.Slot.GetSlotId(o.ChannelID)
+	if s.opts.Slot.SlotLeaderId(slot) != s.opts.NodeId {
+		return wkdb.SubscriberReceipt{}, errors.New("subscriber source leader changed")
+	}
+	// Read only on the source leader, then verify again after replicated apply.
+	old, ok, err := s.wdb.GetSubscriberReceipt(o.ChannelID, o.ChannelType, o.OperationID)
+	if err != nil {
+		return old, err
+	}
+	if ok {
+		if old.Digest != o.Digest() {
+			return old, ErrSubscriberConflict
+		}
+		if old.State != "rejected" || old.Error != "backlog_full" {
+			return old, nil
+		}
+	}
+	if err := s.proposeRecovery(ctx, slot, CMDSubscriberOperation, o); err != nil {
+		return wkdb.SubscriberReceipt{OperationID: o.OperationID, ChannelID: o.ChannelID, ChannelType: o.ChannelType, State: "unknown"}, err
+	}
+	r, found, err := s.wdb.GetSubscriberReceipt(o.ChannelID, o.ChannelType, o.OperationID)
+	if err != nil {
+		return r, err
+	}
+	if !found {
+		return r, errors.New("subscriber receipt not visible; retry on current source leader")
+	}
+	if r.Digest != o.Digest() {
+		return r, ErrSubscriberConflict
+	}
+	return r, nil
+}
+
+func (s *Store) GetSubscriberReceipt(ch string, tp uint8, id string) (wkdb.SubscriberReceipt, bool, error) {
+	return s.wdb.GetSubscriberReceipt(ch, tp, id)
+}
+
+// CompleteSubscriberOperation runs the durable work on the request path. The
+// record is committed before this method is called, so a timeout or process
+// failure leaves only the unfinished tail for background recovery.
+func (s *Store) CompleteSubscriberOperation(ctx context.Context, receipt wkdb.SubscriberReceipt) (wkdb.SubscriberReceipt, error) {
+	if s.recovery == nil {
+		return receipt, errors.New("subscriber recovery is disabled")
+	}
+	if receipt.State != "pending" {
+		return receipt, nil
+	}
+	lock := &s.recovery.workMu[subscriberWorkLock(receipt.ChannelID, receipt.ChannelType, receipt.Version)]
+	lock.Lock()
+	defer lock.Unlock()
+
+	slot := s.opts.Slot.GetSlotId(receipt.ChannelID)
+	for {
+		if err := ctx.Err(); err != nil {
+			return receipt, err
+		}
+		work, ok, err := s.wdb.GetSubscriberWork(receipt.ChannelID, receipt.ChannelType, slot, receipt.Version)
+		if err != nil {
+			return receipt, err
+		}
+		if !ok {
+			latest, found, err := s.wdb.GetSubscriberReceipt(receipt.ChannelID, receipt.ChannelType, receipt.OperationID)
+			if err != nil {
+				return receipt, err
+			}
+			if found {
+				return latest, nil
+			}
+			return receipt, errors.New("subscriber recovery work disappeared")
+		}
+		if err := s.processSubscriberWorkInline(ctx, work); err != nil {
+			return receipt, err
+		}
+		latest, found, err := s.wdb.GetSubscriberReceipt(receipt.ChannelID, receipt.ChannelType, receipt.OperationID)
+		if err != nil {
+			return receipt, err
+		}
+		if !found {
+			return receipt, errors.New("subscriber recovery receipt disappeared")
+		}
+		receipt = latest
+		if receipt.State != "pending" {
+			return receipt, nil
+		}
+	}
+}
+
+func subscriberWorkLock(channelID string, channelType uint8, version uint64) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(channelID))
+	_, _ = h.Write([]byte{channelType})
+	var versionBytes [8]byte
+	for i := range versionBytes {
+		versionBytes[len(versionBytes)-1-i] = byte(version >> (8 * i))
+	}
+	_, _ = h.Write(versionBytes[:])
+	return h.Sum32() % 64
+}
+
+func (s *Store) proposeRecovery(ctx context.Context, slot uint32, tp CMDType, v any) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	if len(data) > wkdb.MaxSubscriberOperationBytes*8 {
+		return errors.New("recovery command too large")
+	}
+	cmd, err := NewCMD(tp, data).Marshal()
+	if err != nil {
+		return err
+	}
+	_, err = s.opts.Slot.ProposeUntilAppliedTimeout(ctx, slot, cmd)
+	return err
+}
+
+func (s *Store) applySubscriberRecovery(slot uint32, cmd *CMD, index uint64) error {
+	if len(cmd.Data) > wkdb.MaxSubscriberOperationBytes*8 {
+		return errors.New("recovery command too large")
+	}
+	switch cmd.CmdType {
+	case CMDSubscriberOperation:
+		var o wkdb.SubscriberOperation
+		if err := json.Unmarshal(cmd.Data, &o); err != nil {
+			return err
+		}
+		if s.opts.Slot.GetSlotId(o.ChannelID) != slot {
+			return errors.New("subscriber operation routed to wrong slot")
+		}
+		return s.wdb.ApplySubscriberOperation(slot, index, o)
+	case CMDConversationEffects:
+		var effects []wkdb.ConversationEffect
+		if err := json.Unmarshal(cmd.Data, &effects); err != nil {
+			return err
+		}
+		for _, e := range effects {
+			if s.opts.Slot.GetSlotId(e.UID) != slot {
+				return errors.New("conversation effect routed to wrong slot")
+			}
+		}
+		return s.wdb.ApplyConversationEffects(effects)
+	case CMDSubscriberCheckpoint:
+		var c wkdb.SubscriberCheckpoint
+		if err := json.Unmarshal(cmd.Data, &c); err != nil {
+			return err
+		}
+		if c.SlotID != slot || s.opts.Slot.GetSlotId(c.ChannelID) != slot {
+			return errors.New("subscriber checkpoint routed to wrong slot")
+		}
+		return s.wdb.CheckpointSubscriberWork(c)
+	}
+	return errors.New("unknown recovery command")
+}
+
+func (s *Store) runSubscriberRecovery(ctx context.Context, worker int) {
+	r := s.recovery
+	// DB ownership partitions scanning, enforcing the node-wide worker limit.
+	cursors := make(map[int][]byte)
+	shard := worker
+	failures := 0
+	for {
+		delay := r.config.Interval
+		if failures > 0 {
+			delay *= time.Duration(1 << min(failures, 6))
+			if delay > 5*time.Second {
+				delay = 5 * time.Second
+			}
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if shard >= s.wdb.GetShardNum() {
+			shard = worker
+		}
+		if shard >= s.wdb.GetShardNum() {
+			continue
+		}
+		work, next, done, err := s.wdb.ListSubscriberWork(shard, cursors[shard], 1)
+		if err == nil {
+			cursors[shard] = next
+			if done {
+				cursors[shard] = nil
+			}
+		}
+		shard += r.config.Workers
+		if err == nil && len(work) > 0 && work[0].NextAttempt <= time.Now().UnixNano() && s.opts.Slot.SlotLeaderId(work[0].SlotID) == s.opts.NodeId {
+			lock := &r.workMu[subscriberWorkLock(work[0].Operation.ChannelID, work[0].Operation.ChannelType, work[0].Version)]
+			lock.Lock()
+			current, found, getErr := s.wdb.GetSubscriberWork(work[0].Operation.ChannelID, work[0].Operation.ChannelType, work[0].SlotID, work[0].Version)
+			if getErr != nil {
+				err = getErr
+			} else if !found {
+				err = nil
+			} else {
+				opCtx, cancel := context.WithTimeout(ctx, r.config.Timeout)
+				err = s.processSubscriberWork(opCtx, current)
+				cancel()
+			}
+			lock.Unlock()
+			if err != nil && ctx.Err() == nil {
+				w := work[0]
+				// Persist retry scheduling so failover/restart cannot create a retry storm.
+				wait := 250 * time.Millisecond * time.Duration(1<<min(w.Attempts, 7))
+				retryCtx, retryCancel := context.WithTimeout(ctx, r.config.Timeout)
+				message := err.Error()
+				if len(message) > 512 {
+					message = message[:512]
+				}
+				_ = s.proposeRecovery(retryCtx, w.SlotID, CMDSubscriberCheckpoint, wkdb.SubscriberCheckpoint{SlotID: w.SlotID, ChannelID: w.Operation.ChannelID, ChannelType: w.Operation.ChannelType, OperationID: w.Operation.OperationID, Version: w.Version, Previous: w.Next, Next: w.Next, RetryAt: time.Now().Add(wait).UnixNano(), Error: message})
+				retryCancel()
+			}
+			if err == nil {
+				r.mu.Lock()
+				r.stats.Pages++
+				r.stats.LastProgress = time.Now().UnixNano()
+				r.mu.Unlock()
+			}
+		}
+		if err != nil {
+			failures++
+			r.mu.Lock()
+			r.stats.Failures++
+			r.stats.LastError = err.Error()
+			r.mu.Unlock()
+		} else {
+			failures = 0
+		}
+	}
+}
+
+func (s *Store) processSubscriberWork(ctx context.Context, w wkdb.SubscriberWork) error {
+	return s.processSubscriberWorkPage(ctx, w, 16, 1)
+}
+
+func (s *Store) processSubscriberWorkInline(ctx context.Context, w wkdb.SubscriberWork) error {
+	return s.processSubscriberWorkPage(ctx, w, subscriberRecoveryInlinePageSize, 16)
+}
+
+func (s *Store) processSubscriberWorkPage(ctx context.Context, w wkdb.SubscriberWork, pageSize int, parallelism int) error {
+	if s.opts.Slot.SlotLeaderId(w.SlotID) != s.opts.NodeId {
+		return errors.New("subscriber source leader changed")
+	}
+	next := min(w.Next+pageSize, len(w.Effects))
+	bySlot := make(map[uint32][]wkdb.ConversationEffect)
+	for _, e := range w.Effects[w.Next:next] {
+		latest, found, err := s.wdb.GetSubscriberIntent(e.ChannelID, e.ChannelType, e.UID)
+		if err != nil {
+			return err
+		}
+		// A later membership mutation supersedes this effect. Advancing the
+		// old checkpoint without replaying it makes churn converge directly to
+		// the latest desired state instead of executing every historical delta.
+		if !found || latest.Version != e.Version {
+			continue
+		}
+		slot := s.opts.Slot.GetSlotId(e.UID)
+		bySlot[slot] = append(bySlot[slot], e)
+	}
+	g, groupCtx := errgroup.WithContext(ctx)
+	g.SetLimit(parallelism)
+	for slot, effects := range bySlot {
+		slot, effects := slot, effects
+		g.Go(func() error {
+			if err := s.proposeRecovery(groupCtx, slot, CMDConversationEffects, effects); err != nil {
+				return fmt.Errorf("subscriber target slot %d: %w", slot, err)
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	done := next == len(w.Effects)
+	if done {
+		if err := s.recovery.finalize(ctx, w); err != nil {
+			return fmt.Errorf("subscriber finalization: %w", err)
+		}
+	}
+	if s.opts.Slot.SlotLeaderId(w.SlotID) != s.opts.NodeId {
+		return errors.New("subscriber source leader changed before checkpoint")
+	}
+	return s.proposeRecovery(ctx, w.SlotID, CMDSubscriberCheckpoint, wkdb.SubscriberCheckpoint{SlotID: w.SlotID, ChannelID: w.Operation.ChannelID, ChannelType: w.Operation.ChannelType, OperationID: w.Operation.OperationID, Version: w.Version, Previous: w.Next, Next: next, Done: done, At: time.Now().UnixNano()})
+}
