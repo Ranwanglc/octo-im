@@ -147,6 +147,9 @@ func (d *conversationConfigHookDB) GetChannelClusterConfig(id string, typ uint8)
 func TestConversationConcurrentSlotWrite(t *testing.T) {
 	var db *conversationConfigHookDB
 	s, ctx := newConversationConsistencyServer(t, func(s *Server) { db = &conversationConfigHookDB{DB: s.db}; s.db = db })
+	// This one-shot hook belongs to the foreground consistency read. A scan
+	// must not consume it on a worker or run test assertions on that goroutine.
+	s.configReconciler.stop()
 	cfg := consistencyConfig()
 	require.NoError(t, s.db.SaveChannelClusterConfig(cfg))
 	before, err := s.slotServer.ReadLeaderState(ctx, 0)
