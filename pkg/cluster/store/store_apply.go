@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -31,26 +32,37 @@ func (s *Store) ApplySlotLogs(slotId uint32, logs []types.Log) error {
 		if err := cmd.Unmarshal(logs[i].Data); err != nil {
 			return &PermanentApplyError{Err: err}
 		}
-		if cmd.CmdType == CMDChannelClusterConfigSave {
-			cmds := []*CMD{cmd}
-			versions := []uint64{logs[i].Index}
-			i++
-			for i < len(logs) {
-				next := &CMD{}
-				if err := next.Unmarshal(logs[i].Data); err != nil {
-					return &PermanentApplyError{Err: err}
-				}
-				if next.CmdType != CMDChannelClusterConfigSave {
-					break
-				}
-				cmds = append(cmds, next)
-				versions = append(versions, logs[i].Index)
-				i++
-			}
-			if err := s.handleChannelClusterConfigSavesForCMDs(cmds, versions); err != nil {
+		switch cmd.CmdType {
+		case CMDSubscriberOperation, CMDSubscriberCheckpoint:
+			cmds, versions, next, err := decodeContiguousSubscriberSourceCommands(logs, i)
+			if err != nil {
 				return err
 			}
-		} else {
+			if err = s.applySubscriberRecoveryCommands(slotId, cmds, versions); err != nil {
+				return err
+			}
+			i = next
+		case CMDChannelClusterConfigSave, CMDAddOrUpdateUserConversations,
+			CMDAddOrUpdateConversationsBatchIfNotExist, CMDConversationEffects:
+			cmds, versions, next, err := decodeContiguousCommands(logs, i, cmd.CmdType)
+			if err != nil {
+				return err
+			}
+			switch cmd.CmdType {
+			case CMDChannelClusterConfigSave:
+				err = s.handleChannelClusterConfigSavesForCMDs(cmds, versions)
+			case CMDAddOrUpdateUserConversations:
+				err = s.handleAddOrUpdateUserConversationsForCMDs(cmds)
+			case CMDAddOrUpdateConversationsBatchIfNotExist:
+				err = s.handleAddOrUpdateConversationsBatchIfNotExistForCMDs(cmds)
+			case CMDConversationEffects:
+				err = s.applyConversationEffectCommands(slotId, cmds)
+			}
+			if err != nil {
+				return err
+			}
+			i = next
+		default:
 			if err := s.applyCMDForSlot(slotId, cmd, logs[i].Index); err != nil {
 				return err
 			}
@@ -72,6 +84,92 @@ func (s *Store) ApplySlotLogs(slotId uint32, logs []types.Log) error {
 		}
 	}
 	return nil
+}
+
+func decodeContiguousSubscriberSourceCommands(logs []types.Log, start int) ([]*CMD, []uint64, int, error) {
+	cmds := make([]*CMD, 0, len(logs)-start)
+	versions := make([]uint64, 0, len(logs)-start)
+	i := start
+	for i < len(logs) {
+		cmd := &CMD{}
+		if err := cmd.Unmarshal(logs[i].Data); err != nil {
+			return nil, nil, start, &PermanentApplyError{Err: err}
+		}
+		if cmd.CmdType != CMDSubscriberOperation && cmd.CmdType != CMDSubscriberCheckpoint {
+			break
+		}
+		cmds = append(cmds, cmd)
+		versions = append(versions, logs[i].Index)
+		i++
+	}
+	return cmds, versions, i, nil
+}
+
+// decodeContiguousCommands restores batching without the old reordering bug:
+// only adjacent commands of the same type may share a database operation.
+func decodeContiguousCommands(logs []types.Log, start int, commandType CMDType) ([]*CMD, []uint64, int, error) {
+	cmds := make([]*CMD, 0, len(logs)-start)
+	versions := make([]uint64, 0, len(logs)-start)
+	i := start
+	for i < len(logs) {
+		cmd := &CMD{}
+		if err := cmd.Unmarshal(logs[i].Data); err != nil {
+			return nil, nil, start, &PermanentApplyError{Err: err}
+		}
+		if cmd.CmdType != commandType {
+			break
+		}
+		cmds = append(cmds, cmd)
+		versions = append(versions, logs[i].Index)
+		i++
+	}
+	return cmds, versions, i, nil
+}
+
+// applyConversationEffectCommands combines adjacent target-slot commands while
+// preserving their order. Repeated lifecycle keys split a batch so a later
+// churn operation can never be applied before an earlier one.
+func (s *Store) applyConversationEffectCommands(slot uint32, cmds []*CMD) error {
+	effects := make([]wkdb.ConversationEffect, 0, wkdb.MaxConversationEffects)
+	seen := make(map[string]struct{}, wkdb.MaxConversationEffects)
+	flush := func() error {
+		if len(effects) == 0 {
+			return nil
+		}
+		if err := s.wdb.ApplyConversationEffects(effects); err != nil {
+			return err
+		}
+		effects = effects[:0]
+		clear(seen)
+		return nil
+	}
+	for _, cmd := range cmds {
+		var page []wkdb.ConversationEffect
+		if err := json.Unmarshal(cmd.Data, &page); err != nil {
+			return &PermanentApplyError{Err: err}
+		}
+		if len(page) == 0 || len(page) > wkdb.MaxConversationEffects {
+			return &PermanentApplyError{Err: fmt.Errorf("invalid conversation effect page")}
+		}
+		for _, effect := range page {
+			if effect.UID == "" || effect.ChannelID == "" || effect.ChannelType == 0 || effect.Version == 0 || (!effect.Deleted && effect.ConversationID == 0) || effect.CreatedAt <= 0 {
+				return &PermanentApplyError{Err: fmt.Errorf("invalid conversation effect")}
+			}
+			if s.opts.Slot.GetSlotId(effect.UID) != slot {
+				return &PermanentApplyError{Err: fmt.Errorf("conversation effect routed to wrong slot")}
+			}
+			key := fmt.Sprintf("%s\x00%s\x00%d", effect.UID, effect.ChannelID, effect.ChannelType)
+			_, duplicate := seen[key]
+			if duplicate || len(effects) == wkdb.MaxConversationEffects {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
+			effects = append(effects, effect)
+			seen[key] = struct{}{}
+		}
+	}
+	return flush()
 }
 
 func (s *Store) applyCMDForSlot(slot uint32, cmd *CMD, index uint64) error {

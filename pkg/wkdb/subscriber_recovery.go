@@ -173,8 +173,20 @@ type SubscriberCheckpoint struct {
 	At          int64  `json:"at"`
 }
 
+// SubscriberRecoveryCommand is one source-slot recovery mutation in Raft log
+// order. Batching these commands only overlaps their WAL sync waits; every
+// command remains an independent atomic Pebble batch and is visible to the
+// command which follows it.
+type SubscriberRecoveryCommand struct {
+	SlotID     uint32
+	Version    uint64
+	Operation  *SubscriberOperation
+	Checkpoint *SubscriberCheckpoint
+}
+
 type SubscriberRecoveryDB interface {
 	ApplySubscriberOperation(uint32, uint64, SubscriberOperation) error
+	ApplySubscriberRecoveryCommands([]SubscriberRecoveryCommand) error
 	GetSubscriberReceipt(string, uint8, string) (SubscriberReceipt, bool, error)
 	GetSubscriberWork(string, uint8, uint32, uint64) (SubscriberWork, bool, error)
 	GetSubscriberWorkPage(SubscriberWork, int) ([]ConversationEffect, error)
@@ -307,6 +319,61 @@ func storeSubscriberReceipt(w pebble.Writer, slot uint32, r SubscriberReceipt) e
 // receipt and pending work atomically. Expected rejections are durable results,
 // not Apply errors that would block replay of committed Raft logs.
 func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o SubscriberOperation) error {
+	return wk.applySubscriberOperation(slot, version, o, nil)
+}
+
+type subscriberRecoverySyncGroup struct {
+	wk      *wukongDB
+	batches []*pebble.Batch
+}
+
+func (g *subscriberRecoverySyncGroup) commit(db *pebble.DB, batch *pebble.Batch) error {
+	if err := db.ApplyNoSyncWait(batch, g.wk.sync); err != nil {
+		return err
+	}
+	g.batches = append(g.batches, batch)
+	return nil
+}
+
+// finish waits for every durability acknowledgement even after a later
+// command failed. A WAL sync failure takes precedence: the caller must retry
+// instead of treating an earlier visible-but-not-durable prefix as permanent.
+func (g *subscriberRecoverySyncGroup) finish(commandErr error) error {
+	var syncErr error
+	for _, batch := range g.batches {
+		if err := batch.SyncWait(); err != nil && syncErr == nil {
+			syncErr = err
+		}
+		_ = batch.Close()
+	}
+	if syncErr != nil {
+		return syncErr
+	}
+	return commandErr
+}
+
+// ApplySubscriberRecoveryCommands preserves Raft order while allowing Pebble's
+// WAL writer to group fsyncs from adjacent source operations/checkpoints.
+func (wk *wukongDB) ApplySubscriberRecoveryCommands(commands []SubscriberRecoveryCommand) error {
+	group := &subscriberRecoverySyncGroup{wk: wk}
+	var commandErr error
+	for _, command := range commands {
+		switch {
+		case command.Operation != nil && command.Checkpoint == nil:
+			commandErr = wk.applySubscriberOperation(command.SlotID, command.Version, *command.Operation, group)
+		case command.Operation == nil && command.Checkpoint != nil:
+			commandErr = wk.checkpointSubscriberWork(*command.Checkpoint, group)
+		default:
+			commandErr = &PermanentApplyError{errors.New("invalid subscriber recovery command")}
+		}
+		if commandErr != nil {
+			break
+		}
+	}
+	return group.finish(commandErr)
+}
+
+func (wk *wukongDB) applySubscriberOperation(slot uint32, version uint64, o SubscriberOperation, group *subscriberRecoverySyncGroup) error {
 	if e := o.Validate(); e != nil {
 		return &PermanentApplyError{e}
 	}
@@ -329,7 +396,12 @@ func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o Subs
 		return nil
 	}
 	batch := db.NewIndexedBatch()
-	defer batch.Close()
+	groupOwnsBatch := false
+	defer func() {
+		if !groupOwnsBatch {
+			_ = batch.Close()
+		}
+	}()
 	if e := wk.pruneSubscriberReceipts(db, batch, slot, o.CreatedAt); e != nil {
 		return e
 	}
@@ -337,7 +409,14 @@ func (wk *wukongDB) ApplySubscriberOperation(slot uint32, version uint64, o Subs
 		if e := recoverySet(batch, recoverySlotKey(recoveryApplied, slot), version); e != nil {
 			return e
 		}
-		return batch.Commit(wk.sync)
+		if group == nil {
+			return batch.Commit(wk.sync)
+		}
+		if e := group.commit(db, batch); e != nil {
+			return e
+		}
+		groupOwnsBatch = true
+		return nil
 	}
 	old, found, e := wk.GetSubscriberReceipt(o.ChannelID, o.ChannelType, o.OperationID)
 	if e != nil {
@@ -683,6 +762,10 @@ func (wk *wukongDB) ListSubscriberWork(shard int, after []byte, limit int) ([]Su
 
 // CheckpointSubscriberWork is a compare-and-set over the exact source progress.
 func (wk *wukongDB) CheckpointSubscriberWork(c SubscriberCheckpoint) error {
+	return wk.checkpointSubscriberWork(c, nil)
+}
+
+func (wk *wukongDB) checkpointSubscriberWork(c SubscriberCheckpoint, group *subscriberRecoverySyncGroup) error {
 	partitionLock := &wk.subscriberRecoveryMu[wk.GetChannelShardIndex(c.ChannelID, c.ChannelType)]
 	partitionLock.Lock()
 	defer partitionLock.Unlock()
@@ -719,7 +802,12 @@ func (wk *wukongDB) CheckpointSubscriberWork(c SubscriberCheckpoint) error {
 		return e
 	}
 	batch := db.NewBatch()
-	defer batch.Close()
+	groupOwnsBatch := false
+	defer func() {
+		if !groupOwnsBatch {
+			_ = batch.Close()
+		}
+	}()
 	decrement := uint64(c.Next - w.Next)
 	if w.Paged {
 		// Remove only chunks whose final effect has been acknowledged. Partial
@@ -771,7 +859,14 @@ func (wk *wukongDB) CheckpointSubscriberWork(c SubscriberCheckpoint) error {
 	if e := storeSubscriberReceipt(batch, c.SlotID, r); e != nil {
 		return e
 	}
-	return batch.Commit(wk.sync)
+	if group == nil {
+		return batch.Commit(wk.sync)
+	}
+	if e := group.commit(db, batch); e != nil {
+		return e
+	}
+	groupOwnsBatch = true
+	return nil
 }
 
 // Cleanup uses the replicated operation timestamp, never a follower's clock.

@@ -30,6 +30,7 @@ type recoverySlots struct {
 	loseReply   atomic.Bool
 	active      atomic.Int32
 	peak        atomic.Int32
+	targetBlock chan struct{}
 }
 
 func (s *recoverySlots) GetSlotId(v string) uint32 {
@@ -57,6 +58,13 @@ func (s *recoverySlots) ProposeUntilAppliedTimeout(ctx context.Context, slot uin
 		}
 		if s.failTargets.Load() {
 			return nil, context.DeadlineExceeded
+		}
+		if s.targetBlock != nil {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-s.targetBlock:
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -433,6 +441,65 @@ func TestRecoveryLocksOnlyBlockSameOperationAndAreReclaimed(t *testing.T) {
 	other()
 	first()
 	require.Empty(t, r.workLocks)
+}
+
+func TestRecoveryTargetProposalAdmission(t *testing.T) {
+	t.Run("node capacity", func(t *testing.T) {
+		s, slots := recoveryStore(t)
+		cfg := recoveryConfig()
+		cfg.Paused = true
+		require.NoError(t, s.StartSubscriberRecovery(cfg, func(context.Context, wkdb.SubscriberWork) error { return nil }))
+		slots.targetBlock = make(chan struct{})
+		receipts := make([]wkdb.SubscriberReceipt, 0, subscriberRecoveryForegroundLimit)
+		for i := 0; i < subscriberRecoveryForegroundLimit; i++ {
+			uid := uidForRecoverySlot(slots, uint32(i%8))
+			r, err := s.SubmitSubscriberOperation(context.Background(), wkdb.SubscriberOperation{
+				OperationID: fmt.Sprintf("capacity-%d", i), ChannelID: fmt.Sprintf("capacity-group-%d", i),
+				ChannelType: 2, Mode: "add", UIDs: []string{uid},
+			})
+			require.NoError(t, err)
+			receipts = append(receipts, r)
+		}
+		errs := completeRecoveryConcurrently(s, receipts)
+		require.Eventually(t, func() bool {
+			stats := s.SubscriberRecoveryStats()
+			return stats.TargetInflight == subscriberRecoveryForegroundLimit
+		}, time.Second, time.Millisecond)
+		close(slots.targetBlock)
+		for range receipts {
+			require.NoError(t, <-errs)
+		}
+		stats := s.SubscriberRecoveryStats()
+		require.Equal(t, subscriberRecoveryTargetProposalLimit, stats.TargetCapacity)
+		require.Equal(t, subscriberRecoveryForegroundLimit, stats.TargetForegroundCapacity)
+		require.Equal(t, subscriberRecoveryForegroundLimit, stats.TargetPeak)
+		require.Zero(t, stats.TargetInflight)
+		require.Zero(t, stats.TargetWaiting)
+	})
+}
+
+func uidForRecoverySlot(slots *recoverySlots, target uint32) string {
+	for i := 0; ; i++ {
+		uid := fmt.Sprintf("target-%d-%d", target, i)
+		if slots.GetSlotId(uid) == target {
+			return uid
+		}
+	}
+}
+
+func completeRecoveryConcurrently(s *Store, receipts []wkdb.SubscriberReceipt) <-chan error {
+	start := make(chan struct{})
+	errs := make(chan error, len(receipts))
+	for _, receipt := range receipts {
+		receipt := receipt
+		go func() {
+			<-start
+			_, err := s.CompleteSubscriberOperation(context.Background(), receipt)
+			errs <- err
+		}()
+	}
+	close(start)
+	return errs
 }
 
 func TestRecoveryPausedAfterRestartFencesOldPendingWork(t *testing.T) {

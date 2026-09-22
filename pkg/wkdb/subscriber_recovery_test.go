@@ -455,3 +455,33 @@ func TestSubscriberRecoveryRejectsUnboundedExistingMember(t *testing.T) {
 	invalid := recoveryOperation("invalid", "add", " ")
 	require.Error(t, invalid.Validate())
 }
+
+func TestSubscriberRecoveryCommandBatchPreservesVisibilityAndReplay(t *testing.T) {
+	db := recoveryTestDB(t, t.TempDir())
+	defer db.Close()
+	operation := recoveryOperation("grouped", "add", "a")
+	commands := []SubscriberRecoveryCommand{
+		{SlotID: 1, Version: 1, Operation: &operation},
+		{SlotID: 1, Version: 2, Checkpoint: &SubscriberCheckpoint{
+			SlotID: 1, ChannelID: operation.ChannelID, ChannelType: operation.ChannelType,
+			OperationID: operation.OperationID, Version: 1, Previous: 0, Next: 1,
+			Done: true, At: time.Now().UnixNano(),
+		}},
+	}
+	recovery := SubscriberRecoveryDB(db)
+	require.NoError(t, recovery.ApplySubscriberRecoveryCommands(commands))
+	require.NoError(t, recovery.ApplySubscriberRecoveryCommands(commands), "durable replay must be idempotent")
+
+	receipt, found, err := db.GetSubscriberReceipt(operation.ChannelID, operation.ChannelType, operation.OperationID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, "complete", receipt.State)
+	require.Equal(t, 1, receipt.Completed)
+	_, pending, err := db.GetSubscriberWork(operation.ChannelID, operation.ChannelType, 1, 1)
+	require.NoError(t, err)
+	require.False(t, pending)
+	members, err := db.GetSubscribers(operation.ChannelID, operation.ChannelType)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	require.Equal(t, "a", members[0].Uid)
+}

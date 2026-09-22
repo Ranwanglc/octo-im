@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -138,4 +139,41 @@ func TestSlotApplyRecoveryPrefixCannotUndoInterruptedLegacyDelete(t *testing.T) 
 	require.NoError(t, s.ApplySlotLogs(slot, logs))
 	_, err = db.GetConversation("a", "g", 2)
 	require.ErrorIs(t, err, wkdb.ErrNotFound, "replayed recovery cannot resurrect the legacy deletion")
+}
+
+func TestSlotApplyBatchesAdjacentConversationEffectsWithoutReordering(t *testing.T) {
+	s, slots := recoveryStore(t)
+	db := s.DB()
+	uidA := uidForRecoverySlot(slots, 3)
+	uidB := ""
+	for i := 0; ; i++ {
+		candidate := fmt.Sprintf("batched-target-3-%d", i)
+		if candidate != uidA && slots.GetSlotId(candidate) == 3 {
+			uidB = candidate
+			break
+		}
+	}
+	now := time.Now().UnixNano()
+	effect := func(uid, channel string, version, conversationID uint64, deleted bool) []byte {
+		body, err := json.Marshal([]wkdb.ConversationEffect{{
+			UID: uid, ChannelID: channel, ChannelType: 2, Version: version,
+			ConversationID: conversationID, Deleted: deleted, CreatedAt: now,
+		}})
+		require.NoError(t, err)
+		return body
+	}
+	logs := []types.Log{
+		applyTestLog(t, 1, CMDConversationEffects, effect(uidA, "g-a", 1, 11, false)),
+		applyTestLog(t, 2, CMDConversationEffects, effect(uidB, "g-b", 1, 12, false)),
+		// The repeated key must be applied after the first batch, not collapsed
+		// ahead of it or reordered around it.
+		applyTestLog(t, 3, CMDConversationEffects, effect(uidA, "g-a", 2, 0, true)),
+	}
+	require.NoError(t, s.ApplySlotLogs(3, logs))
+	_, err := db.GetConversation(uidA, "g-a", 2)
+	require.ErrorIs(t, err, wkdb.ErrNotFound)
+	conversation, err := db.GetConversation(uidB, "g-b", 2)
+	require.NoError(t, err)
+	require.Equal(t, uint64(12), conversation.Id)
+	require.NoError(t, s.ApplySlotLogs(3, logs), "replaying a batched prefix must remain idempotent")
 }

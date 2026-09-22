@@ -18,9 +18,16 @@ var ErrInvalidSubscriberOperation = errors.New("invalid subscriber operation")
 
 var ErrSubscriberConflict = errors.New("operation_id already used for different subscriber input")
 
-// Foreground requests amortize source checkpoints across a larger page. Each
-// target proposal still obeys MaxConversationEffects and parallelism stays 16.
-const subscriberRecoveryInlinePageSize = 1024
+// Keep foreground fan-out bounded across both a single operation and the node.
+// Recovery is maintenance traffic and must not saturate slot apply behind HTTP
+// requests when several large membership changes arrive together.
+const (
+	subscriberRecoveryInlinePageSize        = 1024
+	subscriberRecoveryInlineParallelism     = 8
+	subscriberRecoveryTargetProposalLimit   = 16
+	subscriberRecoveryForegroundLimit       = 14
+	subscriberRecoveryMinimumProposalBudget = 2 * time.Second
+)
 
 type SubscriberRecoveryConfig struct {
 	Workers    int
@@ -32,22 +39,29 @@ type SubscriberRecoveryConfig struct {
 }
 
 type SubscriberRecoveryStats struct {
-	Workers      int    `json:"workers"`
-	Pages        uint64 `json:"pages"`
-	Failures     uint64 `json:"failures"`
-	LastProgress int64  `json:"last_progress,omitempty"`
-	LastError    string `json:"last_error,omitempty"`
+	Workers                  int    `json:"workers"`
+	Pages                    uint64 `json:"pages"`
+	Failures                 uint64 `json:"failures"`
+	LastProgress             int64  `json:"last_progress,omitempty"`
+	LastError                string `json:"last_error,omitempty"`
+	TargetCapacity           int    `json:"target_capacity"`
+	TargetForegroundCapacity int    `json:"target_foreground_capacity"`
+	TargetInflight           int    `json:"target_inflight"`
+	TargetWaiting            int    `json:"target_waiting"`
+	TargetPeak               int    `json:"target_peak"`
 }
 
 type subscriberRecovery struct {
-	config    SubscriberRecoveryConfig
-	finalize  func(context.Context, wkdb.SubscriberWork) error
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	workMu    sync.Mutex
-	workLocks map[subscriberWorkKey]*subscriberWorkGate
-	mu        sync.Mutex
-	stats     SubscriberRecoveryStats
+	config                 SubscriberRecoveryConfig
+	finalize               func(context.Context, wkdb.SubscriberWork) error
+	cancel                 context.CancelFunc
+	wg                     sync.WaitGroup
+	workMu                 sync.Mutex
+	workLocks              map[subscriberWorkKey]*subscriberWorkGate
+	targetTokens           chan struct{}
+	foregroundTargetTokens chan struct{}
+	mu                     sync.Mutex
+	stats                  SubscriberRecoveryStats
 }
 
 // StartSubscriberRecovery must be called once, after the API finalizer is wired
@@ -73,7 +87,18 @@ func (s *Store) StartSubscriberRecovery(cfg SubscriberRecoveryConfig, finalize f
 		return errors.New("subscriber recovery finalizer is required")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	r := &subscriberRecovery{config: cfg, finalize: finalize, cancel: cancel, stats: SubscriberRecoveryStats{Workers: cfg.Workers}}
+	r := &subscriberRecovery{
+		config:                 cfg,
+		finalize:               finalize,
+		cancel:                 cancel,
+		targetTokens:           make(chan struct{}, subscriberRecoveryTargetProposalLimit),
+		foregroundTargetTokens: make(chan struct{}, subscriberRecoveryForegroundLimit),
+		stats: SubscriberRecoveryStats{
+			Workers:                  cfg.Workers,
+			TargetCapacity:           subscriberRecoveryTargetProposalLimit,
+			TargetForegroundCapacity: subscriberRecoveryForegroundLimit,
+		},
+	}
 	r.workLocks = make(map[subscriberWorkKey]*subscriberWorkGate)
 	s.recovery = r
 	s.recoveryEnabled.Store(!cfg.Paused || s.wdb.SubscriberRecoveryActive())
@@ -349,23 +374,69 @@ func (s *Store) proposeRecovery(ctx context.Context, slot uint32, tp CMDType, v 
 	return err
 }
 
+// proposeConversationEffects limits only recovery fan-out. Source operation
+// and checkpoint commands remain unthrottled so progress can always be
+// recorded. A small deadline reserve prevents a request which spent its budget
+// waiting for admission from appending work that it can no longer await.
+func (s *Store) proposeConversationEffects(ctx context.Context, slot uint32, effects []wkdb.ConversationEffect, foreground bool) error {
+	r := s.recovery
+	r.mu.Lock()
+	r.stats.TargetWaiting++
+	r.mu.Unlock()
+	waiting := true
+	finishWaiting := func() {
+		if !waiting {
+			return
+		}
+		r.mu.Lock()
+		r.stats.TargetWaiting--
+		r.mu.Unlock()
+		waiting = false
+	}
+	if foreground {
+		select {
+		case r.foregroundTargetTokens <- struct{}{}:
+			defer func() { <-r.foregroundTargetTokens }()
+		case <-ctx.Done():
+			finishWaiting()
+			return ctx.Err()
+		}
+	}
+
+	select {
+	case r.targetTokens <- struct{}{}:
+	case <-ctx.Done():
+		finishWaiting()
+		return ctx.Err()
+	}
+	defer func() { <-r.targetTokens }()
+	finishWaiting()
+	if foreground {
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < subscriberRecoveryMinimumProposalBudget {
+			return context.DeadlineExceeded
+		}
+	}
+	r.mu.Lock()
+	r.stats.TargetInflight++
+	if r.stats.TargetInflight > r.stats.TargetPeak {
+		r.stats.TargetPeak = r.stats.TargetInflight
+	}
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		r.stats.TargetInflight--
+		r.mu.Unlock()
+	}()
+	return s.proposeRecovery(ctx, slot, CMDConversationEffects, effects)
+}
+
 func (s *Store) applySubscriberRecovery(slot uint32, cmd *CMD, index uint64) error {
 	if len(cmd.Data) > wkdb.MaxSubscriberOperationBytes*8 {
 		return &PermanentApplyError{Err: errors.New("recovery command too large")}
 	}
 	switch cmd.CmdType {
 	case CMDSubscriberOperation:
-		var o wkdb.SubscriberOperation
-		if err := json.Unmarshal(cmd.Data, &o); err != nil {
-			return &PermanentApplyError{Err: err}
-		}
-		if s.opts.Slot.GetSlotId(o.ChannelID) != slot {
-			return &PermanentApplyError{Err: errors.New("subscriber operation routed to wrong slot")}
-		}
-		if err := o.Validate(); err != nil {
-			return &PermanentApplyError{Err: err}
-		}
-		return s.wdb.ApplySubscriberOperation(slot, index, o)
+		return s.applySubscriberRecoveryCommands(slot, []*CMD{cmd}, []uint64{index})
 	case CMDConversationEffects:
 		var effects []wkdb.ConversationEffect
 		if err := json.Unmarshal(cmd.Data, &effects); err != nil {
@@ -384,16 +455,47 @@ func (s *Store) applySubscriberRecovery(slot uint32, cmd *CMD, index uint64) err
 		}
 		return s.wdb.ApplyConversationEffects(effects)
 	case CMDSubscriberCheckpoint:
-		var c wkdb.SubscriberCheckpoint
-		if err := json.Unmarshal(cmd.Data, &c); err != nil {
-			return &PermanentApplyError{Err: err}
-		}
-		if c.SlotID != slot || s.opts.Slot.GetSlotId(c.ChannelID) != slot {
-			return &PermanentApplyError{Err: errors.New("subscriber checkpoint routed to wrong slot")}
-		}
-		return s.wdb.CheckpointSubscriberWork(c)
+		return s.applySubscriberRecoveryCommands(slot, []*CMD{cmd}, []uint64{index})
 	}
 	return &PermanentApplyError{Err: errors.New("unknown recovery command")}
+}
+
+func (s *Store) applySubscriberRecoveryCommands(slot uint32, cmds []*CMD, versions []uint64) error {
+	if len(cmds) != len(versions) || len(cmds) == 0 {
+		return &PermanentApplyError{Err: errors.New("invalid recovery command batch")}
+	}
+	commands := make([]wkdb.SubscriberRecoveryCommand, 0, len(cmds))
+	for i, cmd := range cmds {
+		if len(cmd.Data) > wkdb.MaxSubscriberOperationBytes*8 {
+			return &PermanentApplyError{Err: errors.New("recovery command too large")}
+		}
+		switch cmd.CmdType {
+		case CMDSubscriberOperation:
+			var operation wkdb.SubscriberOperation
+			if err := json.Unmarshal(cmd.Data, &operation); err != nil {
+				return &PermanentApplyError{Err: err}
+			}
+			if s.opts.Slot.GetSlotId(operation.ChannelID) != slot {
+				return &PermanentApplyError{Err: errors.New("subscriber operation routed to wrong slot")}
+			}
+			if err := operation.Validate(); err != nil {
+				return &PermanentApplyError{Err: err}
+			}
+			commands = append(commands, wkdb.SubscriberRecoveryCommand{SlotID: slot, Version: versions[i], Operation: &operation})
+		case CMDSubscriberCheckpoint:
+			var checkpoint wkdb.SubscriberCheckpoint
+			if err := json.Unmarshal(cmd.Data, &checkpoint); err != nil {
+				return &PermanentApplyError{Err: err}
+			}
+			if checkpoint.SlotID != slot || s.opts.Slot.GetSlotId(checkpoint.ChannelID) != slot {
+				return &PermanentApplyError{Err: errors.New("subscriber checkpoint routed to wrong slot")}
+			}
+			commands = append(commands, wkdb.SubscriberRecoveryCommand{SlotID: slot, Version: versions[i], Checkpoint: &checkpoint})
+		default:
+			return &PermanentApplyError{Err: errors.New("invalid recovery command batch")}
+		}
+	}
+	return s.wdb.ApplySubscriberRecoveryCommands(commands)
 }
 
 func (s *Store) runSubscriberRecovery(ctx context.Context, worker int) {
@@ -483,14 +585,14 @@ func (s *Store) runSubscriberRecovery(ctx context.Context, worker int) {
 }
 
 func (s *Store) processSubscriberWork(ctx context.Context, w wkdb.SubscriberWork) error {
-	return s.processSubscriberWorkPage(ctx, w, 16, 1)
+	return s.processSubscriberWorkPage(ctx, w, 16, 1, false)
 }
 
 func (s *Store) processSubscriberWorkInline(ctx context.Context, w wkdb.SubscriberWork) error {
-	return s.processSubscriberWorkPage(ctx, w, subscriberRecoveryInlinePageSize, 16)
+	return s.processSubscriberWorkPage(ctx, w, subscriberRecoveryInlinePageSize, subscriberRecoveryInlineParallelism, true)
 }
 
-func (s *Store) processSubscriberWorkPage(ctx context.Context, w wkdb.SubscriberWork, pageSize int, parallelism int) error {
+func (s *Store) processSubscriberWorkPage(ctx context.Context, w wkdb.SubscriberWork, pageSize int, parallelism int, foreground bool) error {
 	if s.opts.Slot.SlotLeaderId(w.SlotID) != s.opts.NodeId {
 		return errors.New("subscriber source leader changed")
 	}
@@ -514,14 +616,17 @@ func (s *Store) processSubscriberWorkPage(ctx context.Context, w wkdb.Subscriber
 		slot := s.opts.Slot.GetSlotId(e.UID)
 		bySlot[slot] = append(bySlot[slot], e)
 	}
-	g, groupCtx := errgroup.WithContext(ctx)
+	var g errgroup.Group
 	g.SetLimit(parallelism)
 	for slot, effects := range bySlot {
 		slot, effects := slot, effects
 		g.Go(func() error {
 			for start := 0; start < len(effects); start += wkdb.MaxConversationEffects {
 				page := effects[start:min(start+wkdb.MaxConversationEffects, len(effects))]
-				if err := s.proposeRecovery(groupCtx, slot, CMDConversationEffects, page); err != nil {
+				// Each target command is idempotent. Let already-admitted siblings
+				// finish even if another target fails admission; canceling the group
+				// here turns a local deadline guard into Raft apply timeouts.
+				if err := s.proposeConversationEffects(ctx, slot, page, foreground); err != nil {
 					return fmt.Errorf("subscriber target slot %d: %w", slot, err)
 				}
 			}

@@ -13,7 +13,9 @@ func TestApplyWaitConcurrentNotificationAndRelease(t *testing.T) {
 		wg.Add(1)
 		go func() { defer wg.Done(); w.didApply("key", i) }()
 		<-p.waitC
-		w.put(p)
+		if !w.put(p) {
+			t.Fatal("notified waiter must be complete")
+		}
 		wg.Wait()
 	}
 }
@@ -21,7 +23,9 @@ func TestApplyWaitConcurrentNotificationAndRelease(t *testing.T) {
 func TestApplyWaitFailedAdmissionCannotNotifyReusedWaiter(t *testing.T) {
 	w := newWait()
 	p := w.waitApply("key", 1)
-	w.put(p) // admission failed before an apply notification
+	if w.put(p) { // admission failed before an apply notification
+		t.Fatal("detached waiter must not be complete")
+	}
 	next := w.waitApply("key", 2)
 	w.didApply("key", 1)
 	select {
@@ -31,7 +35,9 @@ func TestApplyWaitFailedAdmissionCannotNotifyReusedWaiter(t *testing.T) {
 	}
 	w.didApply("key", 2)
 	<-next.waitC
-	w.put(next)
+	if !w.put(next) {
+		t.Fatal("notified waiter must be complete")
+	}
 }
 
 func TestApplyWait_didApply(t *testing.T) {
