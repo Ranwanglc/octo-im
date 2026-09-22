@@ -39,6 +39,7 @@ def main():
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
     events, nodes, expected = [], [], {}
+    reservations = {}
     channels = [f"config-reconcile-{i}" for i in range(12)]
 
     def record(kind, **data):
@@ -48,9 +49,14 @@ def main():
             stream.write(json.dumps(entry) + "\n")
 
     def port():
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            return sock.getsockname()[1]
+        # Keep future joiners' ports bound until launch. Closing immediately
+        # lets an outgoing connection (or another fixture) reuse them while
+        # the first node is creating its initial channels.
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        number = sock.getsockname()[1]
+        reservations[number] = sock
+        return number
 
     for index in range(3):
         folder = root / f"node{index}"
@@ -99,6 +105,10 @@ def main():
         config_path.write_text(json.dumps(cfg, indent=2))
         env = {key: value for key, value in os.environ.items() if not key.startswith("WK_")}
         env["GOMAXPROCS"] = "4"
+        for number in ports.values():
+            reservation = reservations.pop(number, None)
+            if reservation is not None:
+                reservation.close()
         with (node["dir"] / "stdout.log").open("ab") as stream:
             node["process"] = subprocess.Popen([str(binary.resolve()), "--config", str(config_path), "--mode", "release"],
                                                cwd=node["dir"], stdout=stream, stderr=subprocess.STDOUT, env=env)
@@ -133,7 +143,8 @@ def main():
     def ready(group):
         def check():
             for node in group:
-                assert node["process"].poll() is None, f"node {node['id']} exited"
+                if node["process"].poll() is not None:
+                    raise RuntimeError(f"node {node['id']} exited; inspect its stdout.log")
                 assert call(node, "/health")["status"] == 200
             response = call(nodes[0], "/cluster/allslot")
             assert response["status"] == 200, response
@@ -244,6 +255,8 @@ def main():
         print(json.dumps(result), flush=True)
     finally:
         stop(nodes)
+        for reservation in reservations.values():
+            reservation.close()
         if not args.keep_data:
             for node in nodes:
                 data = node["dir"] / "data"
