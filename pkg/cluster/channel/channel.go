@@ -70,6 +70,7 @@ func (ch *Channel) switchConfig(cfg rafttype.Config) error {
 }
 
 var ErrConfigConflict = errors.New("channel configuration conflicts with runtime")
+var ErrConfigNotReady = errors.New("channel configuration is waiting for durable hard state")
 
 // Compare and step on the owner: comparing the creation-time metadata snapshot
 // misses later updates and replaying ConfChange resets replica sync progress.
@@ -79,35 +80,54 @@ func (ch *Channel) applyConfig(ctx context.Context, cfg rafttype.Config) error {
 		if r != ch {
 			return raftgroup.ErrRaftNotExist
 		}
-		current := ch.Config()
-		if cfg.Version < current.Version {
-			return fmt.Errorf("%w: incoming=%d runtime=%d", raft.ErrConfigVersionStale, cfg.Version, current.Version)
-		}
-		if cfg.Term != 0 && cfg.Term < current.Term {
-			return fmt.Errorf("%w: incoming term=%d runtime term=%d", ErrConfigConflict, cfg.Term, current.Term)
-		}
-		if sameChannelConfig(current, cfg) {
-			return nil
-		}
-		if cfg.Version != 0 && cfg.Version == current.Version {
-			return fmt.Errorf("%w: incoming=%+v runtime=%+v", ErrConfigConflict, cfg, current)
-		}
-		if err := ch.Step(rafttype.Event{Type: rafttype.ConfChange, Config: cfg}); err != nil {
-			return err
-		}
-		ch.needsConfigResume = true
-		return nil
+		return ch.applyConfigOnOwner(cfg)
 	})
 	if err != nil {
 		return err
 	}
+	return ch.resumeConfig(ctx)
+}
+
+// Also used before publishing a newly created channel, on the same owner that
+// will subsequently run its Step/Tick/Ready calls. No storage or network I/O.
+func (ch *Channel) applyConfigOnOwner(cfg rafttype.Config) error {
+	current := ch.Config()
+	if cfg.Version < current.Version {
+		return fmt.Errorf("%w: incoming=%d runtime=%d", raft.ErrConfigVersionStale, cfg.Version, current.Version)
+	}
+	// Match Raft's normalization before the idempotency comparison. Restored
+	// hard state can exceed metadata; the slot owner repairs that metadata later.
+	cfg.Term = max(cfg.Term, current.Term)
+	if !slices.Contains(cfg.Replicas, ch.s.opts.NodeId) {
+		cfg.Role = rafttype.RoleLearner
+		if cfg.Leader == ch.s.opts.NodeId {
+			cfg.Leader = 0
+		}
+	}
+	if sameChannelConfig(current, cfg) {
+		return nil
+	}
+	if cfg.Version != 0 && cfg.Version == current.Version {
+		return fmt.Errorf("%w: incoming=%+v runtime=%+v", ErrConfigConflict, cfg, current)
+	}
+	if err := ch.Step(rafttype.Event{Type: rafttype.ConfChange, Config: cfg}); err != nil {
+		return err
+	}
+	ch.needsConfigResume = true
+	return nil
+}
+
+func (ch *Channel) resumeConfig(ctx context.Context) error {
 	// Keep this owner hop after ConfChange: Ready must persist a newly
 	// selected term before ResumeReplication can certify the stored tail.
 	return ch.rg.Do(ctx, ch.channelKey, func(r raftgroup.IRaft) error {
 		if r != ch {
 			return raftgroup.ErrRaftNotExist
 		}
-		if ch.needsConfigResume && len(ch.Config().Replicas) == 1 {
+		if ch.needsConfigResume && ch.IsLeader() && len(ch.Config().Replicas) == 1 {
+			if !ch.LeaderReadReady() {
+				return ErrConfigNotReady
+			}
 			ch.ResumeReplication()
 		}
 		ch.needsConfigResume = false

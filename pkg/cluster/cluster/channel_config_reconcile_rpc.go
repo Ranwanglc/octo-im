@@ -30,9 +30,15 @@ type configReconcileResponse struct {
 }
 
 func (s *Server) requestChannelConfigReconcile(ctx context.Context, cfg wkdb.ChannelClusterConfig) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	budget := 2 * time.Second
 	if deadline, ok := ctx.Deadline(); ok {
 		budget = min(budget, time.Until(deadline))
+	}
+	if budget <= 0 {
+		return context.DeadlineExceeded
 	}
 	data, err := json.Marshal(configReconcileRequest{cfg.ChannelId, cfg.ChannelType, cfg.ConfVersion, budget})
 	if err != nil {
@@ -72,7 +78,7 @@ func (r *rpcServer) handleChannelConfigReconcile(c *wkserver.Context) {
 		result.ConfigVersion = cfg.ConfVersion
 		if cfg.ConfVersion != req.ConfigVersion || cfg.LeaderId != r.s.opts.ConfigOptions.NodeId {
 			result.Outcome = "superseded"
-		} else if dormant, applyErr := r.s.channelServer.ReconcileConfig(ctx, cfg); applyErr == nil {
+		} else if dormant, applyErr := r.s.reconcileLocalChannelConfig(ctx, cfg); applyErr == nil {
 			result.Outcome = "applied"
 			if dormant {
 				result.Outcome = "dormant"

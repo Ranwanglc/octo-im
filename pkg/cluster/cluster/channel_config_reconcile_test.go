@@ -51,6 +51,11 @@ func TestConfigQueueFailureDoesNotBlockScan(t *testing.T) {
 	r.add(key, true)
 	_, revision, ok := r.take()
 	require.True(t, ok)
+	// Concurrent writes and read retries must not disable pressure eviction.
+	for i := 0; i < 100; i++ {
+		r.add(key, true)
+		r.add(key, false)
+	}
 	r.finish(key, revision, errors.New("peer down"))
 	require.True(t, r.add(channelConfigKey{"next persisted row", 2}, false),
 		"a full queue of failed tasks must yield space to the recovery scan")
@@ -161,6 +166,9 @@ func TestConfigReconcilePersistedChanges(t *testing.T) {
 	for _, mode := range []string{"notification", "scan", "read-hint"} {
 		t.Run(mode, func(t *testing.T) {
 			s, ctx := newConversationConsistencyServer(t, func(s *Server) {
+				if mode != "scan" {
+					s.configReconciler.page = func(uint64, int) ([]wkdb.ChannelClusterConfig, error) { return nil, nil }
+				}
 				if mode != "notification" {
 					// Simulate losing the post-write callback, as on a process crash.
 					s.store = store.New(store.NewOptions(store.WithNodeId(1), store.WithSlot(s.slotServer), store.WithChannel(s.channelServer), store.WithDB(s.db)))
@@ -169,6 +177,11 @@ func TestConfigReconcilePersistedChanges(t *testing.T) {
 			cfg, err := s.GetOrCreateChannelClusterConfigFromSlotLeader("recovery", 2)
 			require.NoError(t, err)
 			require.NoError(t, s.channelServer.WakeLeaderIfNeed(cfg))
+			require.Eventually(t, func() bool {
+				s.configReconciler.mu.Lock()
+				defer s.configReconciler.mu.Unlock()
+				return len(s.configReconciler.pending) == 0
+			}, time.Second, time.Millisecond, "drain initial creation hints before changing metadata")
 			version, err := s.store.SaveChannelClusterConfig(cfg)
 			require.NoError(t, err)
 			require.Greater(t, version, cfg.ConfVersion)
@@ -188,7 +201,7 @@ func TestConfigReconcilePersistedChanges(t *testing.T) {
 	}
 }
 
-func TestConfigReadHintOnlyForLag(t *testing.T) {
+func TestConfigReadHintForDivergenceButNotNewerRuntime(t *testing.T) {
 	cfg := consistencyConfig()
 	cfg.ConfVersion = 3
 	hints := 0
@@ -198,9 +211,9 @@ func TestConfigReadHintOnlyForLag(t *testing.T) {
 	r.hintLaggingConfig(raftgroup.ReadState{Exists: true, ConfigVersion: 3, Ready: false}, cfg)
 	r.hintLaggingConfig(raftgroup.ReadState{Exists: true, ConfigVersion: 4}, cfg)
 	r.hintLaggingConfig(raftgroup.ReadState{}, cfg)
-	require.Equal(t, 1, hints)
+	require.Equal(t, 2, hints)
 	cfg.Learners = []uint64{2}
 	r.hintLaggingConfig(raftgroup.ReadState{}, cfg)
-	require.Equal(t, 2, hints)
+	require.Equal(t, 3, hints)
 	require.False(t, conversationStateReady(raftgroup.ReadState{}, cfg))
 }

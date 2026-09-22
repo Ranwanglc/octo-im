@@ -8,8 +8,10 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/clusterconfig"
+	rafttype "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -77,4 +79,28 @@ func TestChannelConfigReconcileRPC(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(3), state.ConfigVersion)
 	require.Equal(t, uint64(1), state.LeaderID)
+
+	// A different channel exercises the callback to its remote slot owner,
+	// including recovery of a durable term which is ahead of metadata.
+	id += "-term"
+	for owner.cfgServer.SlotLeaderId(owner.getSlotId(id)) != 1 {
+		id += "x"
+	}
+	cfg = wkdb.ChannelClusterConfig{ChannelId: id, ChannelType: 2, LeaderId: 2, Term: 1, Replicas: []uint64{2}}
+	version, err := owner.saveChannelConfig(ctx, cfg)
+	require.NoError(t, err)
+	cfg.ConfVersion = version
+	require.NoError(t, leader.db.SaveRaftHardState(wkutil.ChannelToKey(id, 2), rafttype.HardState{Term: 5}))
+	require.NoError(t, leader.channelServer.WakeLeaderIfNeed(cfg))
+	require.ErrorIs(t, owner.requestChannelConfigReconcile(ctx, cfg), ErrConversationReadRetry)
+	recovered, err := owner.loadConversationConfig(ctx, id, 2)
+	require.NoError(t, err)
+	require.Equal(t, uint32(6), recovered.Term)
+	require.Greater(t, recovered.ConfVersion, cfg.ConfVersion)
+	require.NoError(t, owner.requestChannelConfigReconcile(ctx, recovered))
+	require.NoError(t, leader.ValidateLocalChannelRead(ctx, recovered))
+	_, err = leader.saveChannelConfigTransition(ctx, id, 2, rafttype.Config{
+		Version: cfg.ConfVersion, Term: cfg.Term, Leader: 2, Replicas: []uint64{2},
+	})
+	require.ErrorIs(t, err, ErrConversationReadRetry, "a delayed remote callback cannot regress the recovered metadata")
 }

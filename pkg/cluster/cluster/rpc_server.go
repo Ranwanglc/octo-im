@@ -35,6 +35,7 @@ func newRpcServer(s *Server) *rpcServer {
 }
 
 func (r *rpcServer) setRoutes() {
+	r.s.netServer.Route(channelConfigTransitionPath, r.handleChannelConfigTransition)
 	r.s.netServer.Route(channelConfigReconcilePath, r.handleChannelConfigReconcile)
 	r.s.netServer.Route(conversationConfigPath, func(c *wkserver.Context) { r.handleConversationRead(c, true) })
 	r.s.netServer.Route(conversationBoundaryPath, func(c *wkserver.Context) { r.handleConversationRead(c, false) })

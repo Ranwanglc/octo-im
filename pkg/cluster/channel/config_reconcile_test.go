@@ -2,6 +2,8 @@ package channel
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -61,11 +63,116 @@ func TestConfigReconcileIdempotentAndMonotonic(t *testing.T) {
 	require.ErrorIs(t, err, raft.ErrConfigVersionStale)
 	newer.ConfVersion, newer.Term = 3, 1
 	_, err = s.ReconcileConfig(ctx, newer)
-	require.ErrorIs(t, err, ErrConfigConflict)
+	require.NoError(t, err)
+	_, err = s.ReconcileConfig(ctx, newer)
+	require.NoError(t, err, "normalized replay is idempotent")
 	state, err := s.ReadLeaderState(ctx, cfg.ChannelId, cfg.ChannelType)
 	require.NoError(t, err)
-	require.Equal(t, uint64(2), state.ConfigVersion)
+	require.Equal(t, uint64(3), state.ConfigVersion)
 	require.Equal(t, uint32(2), state.Term)
+}
+
+type configRestoreDB struct {
+	wkdb.DB
+	cancel        context.CancelFunc
+	failHardState atomic.Bool
+}
+
+func (d *configRestoreDB) GetLastMsg(id string, typ uint8) (wkdb.Message, error) {
+	msg, err := d.DB.GetLastMsg(id, typ)
+	if d.cancel != nil {
+		d.cancel()
+	}
+	return msg, err
+}
+
+func (d *configRestoreDB) SaveRaftHardState(key string, state types.HardState) error {
+	if d.failHardState.Load() {
+		return errors.New("injected hard-state failure")
+	}
+	return d.DB.SaveRaftHardState(key, state)
+}
+
+func TestConfigInitializationCancellationDoesNotPublish(t *testing.T) {
+	db := &configRestoreDB{DB: retryDB(t)}
+	s := NewServer(NewOptions(WithNodeId(1), WithDB(db), WithGroupCount(1), WithTransport(retryNetwork())))
+	require.NoError(t, s.Start())
+	t.Cleanup(s.Stop)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db.cancel = cancel
+	cfg := wkdb.ChannelClusterConfig{ChannelId: "cancel-init", ChannelType: 2, LeaderId: 1, Replicas: []uint64{1}, Learners: []uint64{2}, Term: 4, ConfVersion: 4}
+	_, err := s.ReconcileConfig(ctx, cfg)
+	require.ErrorIs(t, err, context.Canceled)
+	require.False(t, s.ExistChannel(cfg.ChannelId, cfg.ChannelType))
+	db.cancel = nil
+	_, err = s.ReconcileConfig(context.Background(), cfg)
+	require.NoError(t, err)
+	state, err := s.ReadLeaderState(context.Background(), cfg.ChannelId, cfg.ChannelType)
+	require.NoError(t, err)
+	require.True(t, state.Ready)
+	require.Equal(t, cfg.ConfVersion, state.ConfigVersion)
+}
+
+func TestConfigRestoredHigherTermAllowsWakeAndReconcile(t *testing.T) {
+	for _, wake := range []bool{false, true} {
+		db := retryDB(t)
+		cfg := wkdb.ChannelClusterConfig{ChannelId: "higher-term", ChannelType: 2, LeaderId: 1, Replicas: []uint64{1}, Learners: []uint64{2}, Term: 4, ConfVersion: 4}
+		key := wkutil.ChannelToKey(cfg.ChannelId, cfg.ChannelType)
+		require.NoError(t, db.SaveRaftHardState(key, types.HardState{Term: 5}))
+		s := NewServer(NewOptions(WithNodeId(1), WithDB(db), WithGroupCount(1), WithTransport(retryNetwork())))
+		require.NoError(t, s.Start())
+		t.Cleanup(s.Stop)
+		if wake {
+			require.NoError(t, s.WakeLeaderIfNeed(cfg))
+		} else {
+			_, err := s.ReconcileConfig(context.Background(), cfg)
+			require.NoError(t, err)
+		}
+		state, err := s.ReadLeaderState(context.Background(), cfg.ChannelId, cfg.ChannelType)
+		require.NoError(t, err)
+		require.True(t, state.Ready)
+		require.Equal(t, uint32(5), state.Term)
+		require.Equal(t, cfg.ConfVersion, state.ConfigVersion)
+		require.NoError(t, s.WakeLeaderIfNeed(cfg), "same normalized version remains applicable")
+	}
+}
+
+func TestConfigResumeSurvivesHardStateFailure(t *testing.T) {
+	db := &configRestoreDB{DB: retryDB(t)}
+	msg := retryMessage(1, "alice", "one")
+	msg.MessageSeq, msg.Term = 1, 1
+	require.NoError(t, db.AppendMessages("retry", 2, []wkdb.Message{msg}))
+	db.failHardState.Store(true)
+	s := NewServer(NewOptions(WithNodeId(1), WithDB(db), WithGroupCount(1), WithTransport(retryNetwork())))
+	require.NoError(t, s.Start())
+	t.Cleanup(s.Stop)
+	cfg := wkdb.ChannelClusterConfig{ChannelId: "retry", ChannelType: 2, LeaderId: 1, Replicas: []uint64{1}, Term: 5, ConfVersion: 4}
+	require.ErrorIs(t, s.WakeLeaderIfNeed(cfg), ErrConfigNotReady)
+	ch := s.Channel("retry", 2)
+	require.NotNil(t, ch, "an applied config must not be rolled back on persistence failure")
+	db.failHardState.Store(false)
+	require.Eventually(t, func() bool { return s.WakeLeaderIfNeed(cfg) == nil }, time.Second, time.Millisecond)
+	state, err := s.ReadLeaderState(context.Background(), "retry", 2)
+	require.NoError(t, err)
+	require.True(t, state.Ready)
+	require.Equal(t, uint64(1), state.CommittedIndex, "retry must resume the stored tail")
+	require.Same(t, ch, s.Channel("retry", 2))
+	require.Eventually(t, func() bool {
+		state, err := s.ReadLeaderState(context.Background(), "retry", 2)
+		return err == nil && state.AppliedIndex == 1
+	}, time.Second, time.Millisecond, "finish asynchronous storage before closing the test database")
+}
+
+func TestConfigReconcileLockCancellation(t *testing.T) {
+	s := NewServer(NewOptions(WithNodeId(1), WithDB(retryDB(t)), WithGroupCount(1)))
+	cfg := wkdb.ChannelClusterConfig{ChannelId: "locked", ChannelType: 2, LeaderId: 1, Replicas: []uint64{1}, Term: 1, ConfVersion: 1}
+	s.wakeLeaderLock.Lock(cfg.ChannelId)
+	defer s.wakeLeaderLock.Unlock(cfg.ChannelId)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	_, err := s.ReconcileConfig(ctx, cfg)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
 func TestConfigReconcileDormant(t *testing.T) {

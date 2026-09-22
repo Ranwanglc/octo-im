@@ -248,7 +248,6 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) Stop() {
-	s.cancelFnc()
 	s.configReconciler.stop()
 	s.stopper.Stop()
 	s.eventServer.Stop()
@@ -256,6 +255,7 @@ func (s *Server) Stop() {
 	s.slotServer.Stop()
 	s.channelServer.Stop()
 	s.netServer.Stop()
+	s.cancelFnc()
 	s.store.Stop()
 	s.db.Close()
 	s.channelKeyLock.StopCleanLoop()
@@ -383,23 +383,13 @@ func (s *Server) onSaveSlotConfig(slotId uint32, cfg rafttype.Config) error {
 
 // 保存频道分布式配置（事件）
 func (s *Server) onSaveChannelConfig(channelId string, channelType uint8, cfg rafttype.Config) error {
-
-	channelCfg, err := s.GetOrCreateChannelClusterConfigFromSlotLeader(channelId, channelType)
+	ctx, cancel := context.WithTimeout(s.cancelCtx, 5*time.Second)
+	defer cancel()
+	channelCfg, err := s.saveChannelConfigTransition(ctx, channelId, channelType, cfg)
 	if err != nil {
-		s.Error("onSaveChannelConfig: get channel cluster config failed", zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.Error(err))
+		s.Error("onSaveChannelConfig: transition rejected", zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.Error(err))
 		return err
 	}
-
-	// 更新配置
-	s.updateChannelCfgByConfig(&channelCfg, cfg)
-
-	// 保存配置
-	version, err := s.store.SaveChannelClusterConfig(channelCfg)
-	if err != nil {
-		s.Error("onSaveChannelConfig: save channel cluster config failed", zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.Error(err))
-		return err
-	}
-	channelCfg.ConfVersion = version
 
 	// 切换配置
 	if channelCfg.LeaderId == s.opts.ConfigOptions.NodeId {

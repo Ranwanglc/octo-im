@@ -209,7 +209,7 @@ func (r conversationReader) hintLaggingConfig(state raftgroup.ReadState, cfg wkd
 	if r.hint == nil {
 		return
 	}
-	if state.Exists && state.ConfigVersion < cfg.ConfVersion ||
+	if state.Exists && state.ConfigVersion <= cfg.ConfVersion && !conversationStateReady(state, cfg) ||
 		!state.Exists && (len(cfg.Learners) > 0 || cfg.MigrateFrom != 0 || cfg.MigrateTo != 0) {
 		r.hint(cfg.ChannelId, cfg.ChannelType)
 	}

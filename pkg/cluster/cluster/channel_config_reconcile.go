@@ -104,7 +104,7 @@ func (r *channelConfigReconciler) finish(key channelConfigKey, revision uint64, 
 			// A full queue of unavailable channels must not prevent the scanner
 			// reaching healthy channels further on. Yield this slot under pressure;
 			// the durable metadata will rediscover it on the next complete pass.
-			if len(r.pending) >= r.capacity && task.revision == revision {
+			if len(r.pending) >= r.capacity {
 				delete(r.pending, key)
 			}
 		}
@@ -230,14 +230,15 @@ func (s *Server) initChannelConfigReconciler() {
 
 func (s *Server) hintChannelConfig(id string, typ uint8) {
 	if s.configReconciler != nil {
-		s.configReconciler.add(channelConfigKey{id, typ}, true)
+		// A repeated read observes the same durable work; it is not a new write.
+		s.configReconciler.add(channelConfigKey{id, typ}, false)
 	}
 }
 
 func (s *Server) onChannelConfigSaved(id string, typ uint8) {
 	// Store apply runs on replicas too. Only the slot owner distributes updates.
 	if s.cfgServer.SlotLeaderId(s.getSlotId(id)) == s.opts.ConfigOptions.NodeId {
-		s.hintChannelConfig(id, typ)
+		s.configReconciler.add(channelConfigKey{id, typ}, true)
 	}
 }
 
@@ -262,7 +263,7 @@ func (s *Server) reconcileChannelConfig(ctx context.Context, key channelConfigKe
 		return ErrConversationReadRetry
 	}
 	if cfg.LeaderId == s.opts.ConfigOptions.NodeId {
-		_, err = s.channelServer.ReconcileConfig(ctx, cfg)
+		_, err = s.reconcileLocalChannelConfig(ctx, cfg)
 		return err
 	}
 	return s.requestChannelConfigReconcile(ctx, cfg)

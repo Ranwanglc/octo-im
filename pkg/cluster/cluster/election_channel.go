@@ -38,7 +38,7 @@ func (s *Server) getOrCreateChannelClusterConfigFromLocal(channelId string, chan
 			return wkdb.EmptyChannelClusterConfig, err
 		}
 
-		version, err := s.store.SaveChannelClusterConfig(cfg)
+		version, err := s.saveChannelConfigTimeout(cfg)
 		if err != nil {
 			return wkdb.EmptyChannelClusterConfig, err
 		}
@@ -68,7 +68,7 @@ func (s *Server) getOrCreateChannelClusterConfigFromLocal(channelId string, chan
 
 	// 保存配置
 	if propose {
-		version, err := s.store.SaveChannelClusterConfig(cfg)
+		version, err := s.saveChannelConfigTimeout(cfg)
 		if err != nil {
 			return wkdb.EmptyChannelClusterConfig, err
 		}
