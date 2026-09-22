@@ -87,10 +87,7 @@ func (s *Server) WakeLeaderIfNeed(clusterConfig wkdb.ChannelClusterConfig) error
 	raft := rg.GetRaft(channelKey)
 	if raft != nil {
 		ch := raft.(*Channel)
-		if ch.needUpdate(clusterConfig) {
-			return ch.switchConfig(channelConfigToRaftConfig(s.opts.NodeId, clusterConfig))
-		}
-		return nil
+		return ch.switchConfig(channelConfigToRaftConfig(s.opts.NodeId, clusterConfig))
 	}
 
 	if clusterConfig.LeaderId != s.opts.NodeId {
