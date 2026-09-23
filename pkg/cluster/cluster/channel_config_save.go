@@ -26,13 +26,24 @@ func (s *Server) saveChannelConfig(ctx context.Context, cfg wkdb.ChannelClusterC
 		if before.LeaderID != s.opts.ConfigOptions.NodeId || s.cfgServer.SlotLeaderId(slotID) != s.opts.ConfigOptions.NodeId {
 			return 0, ErrConversationReadRetry
 		}
-		if before.Ready && before.AppliedIndex == before.CommittedIndex {
-			current, err := s.db.GetChannelClusterConfig(cfg.ChannelId, cfg.ChannelType)
-			if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
-				return 0, err
+		if before.Ready {
+			validate := func() error {
+				if s.cfgServer.SlotLeaderId(slotID) != s.opts.ConfigOptions.NodeId {
+					return ErrConversationReadRetry
+				}
+				current, err := s.db.GetChannelClusterConfig(cfg.ChannelId, cfg.ChannelType)
+				if err != nil && !errors.Is(err, wkdb.ErrNotFound) {
+					return err
+				}
+				if current.ConfVersion != cfg.ConfVersion || cfg.Term < current.Term {
+					return raft.ErrConfigVersionStale
+				}
+				return nil
 			}
-			if current.ConfVersion != cfg.ConfVersion || cfg.Term < current.Term {
-				return 0, raft.ErrConfigVersionStale
+			// Reject already-stale decisions cheaply. Recheck after the fixed
+			// admitted prefix applies, while holding proposal admission.
+			if err := validate(); err != nil {
+				return 0, err
 			}
 			data, err := cfg.Marshal()
 			if err != nil {
@@ -47,7 +58,7 @@ func (s *Server) saveChannelConfig(ctx context.Context, cfg wkdb.ChannelClusterC
 			if err != nil {
 				return 0, err
 			}
-			version, err := s.slotServer.ProposeAfterRead(ctx, slotID, before, data)
+			version, err := s.slotServer.ProposeAfterRead(ctx, slotID, before, data, validate)
 			if !errors.Is(err, raftgroup.ErrReadStateChanged) {
 				return version, err
 			}
