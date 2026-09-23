@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"time"
 
@@ -111,7 +112,7 @@ func (s *Server) reconcileLocalChannelConfig(ctx context.Context, cfg wkdb.Chann
 	dormant, applyErr := s.channelServer.ReconcileConfig(ctx, cfg)
 	state, err := s.channelServer.ReadLeaderState(ctx, cfg.ChannelId, cfg.ChannelType)
 	if err != nil {
-		return dormant, err
+		return dormant, errors.Join(applyErr, err)
 	}
 	if state.Exists && state.ConfigVersion <= cfg.ConfVersion &&
 		(state.Term > cfg.Term || state.ConfigVersion == cfg.ConfVersion && state.LeaderID != cfg.LeaderId) {

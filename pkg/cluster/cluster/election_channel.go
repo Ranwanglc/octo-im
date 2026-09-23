@@ -147,6 +147,9 @@ func (s *Server) switchLeaderIfNeed(ctx context.Context, cfg *wkdb.ChannelCluste
 // Only current voting replicas count. Desired capacity and learners do not
 // change the quorum of the configuration being replaced. Log freshness, not a
 // peer's current term, chooses the candidate; the new term fences every report.
+// This retains the existing controller-driven election protocol: probing alone
+// does not persist votes or fence a falsely suspected old leader. Configuration
+// propagation and Raft term checks still delimit that pre-existing window.
 func electChannelLeader(cfg *wkdb.ChannelClusterConfig, infos map[uint64]*ChannelLastLogInfoResponse) (bool, error) {
 	voters := make(map[uint64]struct{}, len(cfg.Replicas))
 	for _, id := range cfg.Replicas {
@@ -178,7 +181,20 @@ func electChannelLeader(cfg *wkdb.ChannelClusterConfig, infos map[uint64]*Channe
 
 // 请求副本的最新日志信息
 func (s *Server) requestChannelLastLogInfos(ctx context.Context, replices []uint64, channelId string, channelType uint8) (map[uint64]*ChannelLastLogInfoResponse, error) {
-	timeoutCtx, cancel := context.WithTimeout(ctx, time.Second*4)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// A slow peer must not consume the enclosing worker's entire budget and
+	// discard an otherwise sufficient quorum. Reserve half for publication and
+	// reconciliation; only the child probe may expire with usable partial data.
+	budget := 4 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		budget = min(budget, time.Until(deadline)/2)
+	}
+	if budget <= 0 {
+		return nil, context.DeadlineExceeded
+	}
+	timeoutCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	var requestGroup errgroup.Group
 

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/icluster"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raftgroup"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
@@ -148,7 +149,9 @@ func TestConfigResumeSurvivesHardStateFailure(t *testing.T) {
 	require.NoError(t, s.Start())
 	t.Cleanup(s.Stop)
 	cfg := wkdb.ChannelClusterConfig{ChannelId: "retry", ChannelType: 2, LeaderId: 1, Replicas: []uint64{1}, Term: 5, ConfVersion: 4}
-	require.ErrorIs(t, s.WakeLeaderIfNeed(cfg), ErrConfigNotReady)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, s.createAndApplyConfig(ctx, cfg), context.DeadlineExceeded)
 	ch := s.Channel("retry", 2)
 	require.NotNil(t, ch, "an applied config must not be rolled back on persistence failure")
 	db.failHardState.Store(false)
@@ -192,4 +195,98 @@ func TestConfigReconcileDormant(t *testing.T) {
 	_, err = s.ReconcileConfig(ctx, cfg)
 	require.ErrorIs(t, err, ErrConfigConflict)
 	require.False(t, s.ExistChannel(cfg.ChannelId, cfg.ChannelType))
+}
+
+type resumeConfigCluster struct {
+	icluster.ICluster
+	cfg wkdb.ChannelClusterConfig
+}
+
+func (c resumeConfigCluster) GetOrCreateChannelClusterConfigFromSlotLeader(string, uint8) (wkdb.ChannelClusterConfig, error) {
+	return c.cfg, nil
+}
+
+type temporaryHardStateDB struct {
+	wkdb.DB
+	fail   atomic.Bool
+	failed chan struct{}
+}
+
+func (d *temporaryHardStateDB) SaveRaftHardState(key string, state types.HardState) error {
+	if d.fail.Load() {
+		select {
+		case d.failed <- struct{}{}:
+		default:
+		}
+		return errors.New("temporary hard-state outage")
+	}
+	return d.DB.SaveRaftHardState(key, state)
+}
+
+func TestConfigForegroundWaitsForResume(t *testing.T) {
+	for _, mode := range []string{"wake", "switch", "send", "send-local"} {
+		t.Run(mode, func(t *testing.T) {
+			db := &temporaryHardStateDB{DB: retryDB(t), failed: make(chan struct{}, 1)}
+			msg := retryMessage(1, "alice", "one")
+			msg.MessageSeq, msg.Term = 1, 1
+			require.NoError(t, db.AppendMessages("retry", 2, []wkdb.Message{msg}))
+			cfg := wkdb.ChannelClusterConfig{ChannelId: "retry", ChannelType: 2, LeaderId: 1, Replicas: []uint64{1}, Term: 5, ConfVersion: 5}
+			s := NewServer(NewOptions(WithNodeId(1), WithDB(db), WithGroupCount(1), WithTransport(retryNetwork()), WithCluster(resumeConfigCluster{cfg: cfg})))
+			require.NoError(t, s.Start())
+			t.Cleanup(s.Stop)
+			if mode == "switch" {
+				initial := cfg.Clone()
+				initial.Term, initial.ConfVersion = 1, 1
+				require.NoError(t, s.WakeLeaderIfNeed(initial))
+			}
+			db.fail.Store(true)
+			defer db.fail.Store(false)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			reqs := retryRequests(t, retryMessage(2, "alice", "two"))
+			go func() {
+				var err error
+				switch mode {
+				case "wake":
+					err = s.WakeLeaderIfNeed(cfg)
+				case "switch":
+					err = s.SwitchConfig("retry", 2, cfg)
+				case "send":
+					_, err = s.ProposeBatchUntilAppliedTimeout(ctx, "retry", 2, reqs)
+				case "send-local":
+					_, err = s.ProposeBatchUntilAppliedTimeoutForLocal(ctx, "retry", 2, reqs)
+				}
+				done <- err
+			}()
+			select {
+			case <-db.failed:
+			case <-ctx.Done():
+				t.Fatal("hard-state failure was not reached")
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("foreground operation returned before persistence recovered: %v", err)
+			case <-time.After(50 * time.Millisecond):
+			}
+			state, err := s.ReadLeaderState(ctx, "retry", 2)
+			require.NoError(t, err)
+			require.False(t, state.Ready, "waiting must not weaken hard-state/read safety")
+			db.fail.Store(false)
+			select {
+			case err := <-done:
+				require.NoError(t, err)
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			want := uint64(1)
+			if mode == "send" || mode == "send-local" {
+				want = 2
+			}
+			require.Eventually(t, func() bool {
+				state, err := s.ReadLeaderState(ctx, "retry", 2)
+				return err == nil && state.Ready && state.Term == cfg.Term && state.CommittedIndex == want && state.AppliedIndex == want
+			}, time.Second, time.Millisecond)
+		})
+	}
 }

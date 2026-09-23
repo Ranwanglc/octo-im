@@ -2,10 +2,13 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/channel"
+	"github.com/WuKongIM/WuKongIM/pkg/cluster/store"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
 	rafttype "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
@@ -114,4 +117,63 @@ func TestConfigReconcileExpiredRPCDoesNotRequirePeer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	require.ErrorIs(t, s.requestChannelConfigReconcile(ctx, consistencyConfig()), context.Canceled)
+}
+
+type callbackResumeDB struct {
+	wkdb.DB
+	fail   atomic.Bool
+	failed chan struct{}
+}
+
+func (d *callbackResumeDB) SaveRaftHardState(key string, state rafttype.HardState) error {
+	if d.fail.Load() {
+		select {
+		case d.failed <- struct{}{}:
+		default:
+		}
+		return errors.New("temporary callback persistence failure")
+	}
+	return d.DB.SaveRaftHardState(key, state)
+}
+func TestConfigRoleCallbackWaitsForResume(t *testing.T) {
+	var db *callbackResumeDB
+	s, ctx := newConversationConsistencyServer(t, func(s *Server) {
+		db = &callbackResumeDB{DB: s.db, failed: make(chan struct{}, 1)}
+		s.channelServer = channel.NewServer(channel.NewOptions(channel.WithNodeId(1), channel.WithGroupCount(1),
+			channel.WithTransport(s.opts.ChannelTransport), channel.WithSlot(s.slotServer), channel.WithNode(s.cfgServer),
+			channel.WithCluster(s), channel.WithDB(db), channel.WithRPC(s.rpcClient), channel.WithOnSaveConfig(s.onSaveChannelConfig)))
+		s.store = store.New(store.NewOptions(store.WithNodeId(1), store.WithSlot(s.slotServer), store.WithChannel(s.channelServer), store.WithDB(s.db)))
+	})
+	s.configReconciler.stop()
+	cfg, err := s.GetOrCreateChannelClusterConfigFromSlotLeader("callback-resume", 2)
+	require.NoError(t, err)
+	require.NoError(t, s.channelServer.WakeLeaderIfNeed(cfg))
+	db.fail.Store(true)
+	defer db.fail.Store(false)
+	done := make(chan error, 1)
+	go func() {
+		done <- s.onSaveChannelConfig(cfg.ChannelId, cfg.ChannelType, rafttype.Config{Version: cfg.ConfVersion, Term: cfg.Term + 1, Leader: cfg.LeaderId, Replicas: cfg.Replicas})
+	}()
+	select {
+	case <-db.failed:
+	case <-ctx.Done():
+		t.Fatal("callback did not reach hard-state persistence")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("callback returned terminal error after committed metadata: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	saved, err := s.loadConversationConfig(ctx, cfg.ChannelId, cfg.ChannelType)
+	require.NoError(t, err)
+	require.Greater(t, saved.ConfVersion, cfg.ConfVersion)
+	require.Equal(t, cfg.Term+1, saved.Term)
+	db.fail.Store(false)
+	select {
+	case err := <-done:
+		require.NoError(t, err, "SaveConfig must receive success after transient persistence recovery")
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	require.NoError(t, s.ValidateLocalChannelRead(ctx, saved))
 }

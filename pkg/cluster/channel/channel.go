@@ -120,19 +120,34 @@ func (ch *Channel) applyConfigOnOwner(cfg rafttype.Config) error {
 func (ch *Channel) resumeConfig(ctx context.Context) error {
 	// Keep this owner hop after ConfChange: Ready must persist a newly
 	// selected term before ResumeReplication can certify the stored tail.
-	return ch.rg.Do(ctx, ch.channelKey, func(r raftgroup.IRaft) error {
-		if r != ch {
-			return raftgroup.ErrRaftNotExist
-		}
-		if ch.needsConfigResume && ch.IsLeader() && len(ch.Config().Replicas) == 1 {
-			if !ch.LeaderReadReady() {
-				return ErrConfigNotReady
+	// Retry outside the owner so Ready can retry a transient hard-state write.
+	// Foreground sends/config callbacks must not receive a terminal error for
+	// the first not-ready observation after their config has already applied.
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		err := ch.rg.Do(ctx, ch.channelKey, func(r raftgroup.IRaft) error {
+			if r != ch {
+				return raftgroup.ErrRaftNotExist
 			}
-			ch.ResumeReplication()
+			if ch.needsConfigResume && ch.IsLeader() && len(ch.Config().Replicas) == 1 {
+				if !ch.LeaderReadReady() {
+					return ErrConfigNotReady
+				}
+				ch.ResumeReplication()
+			}
+			ch.needsConfigResume = false
+			return nil
+		})
+		if !errors.Is(err, ErrConfigNotReady) {
+			return err
 		}
-		ch.needsConfigResume = false
-		return nil
-	})
+		select {
+		case <-ctx.Done():
+			return errors.Join(err, ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 func sameChannelConfig(a, b rafttype.Config) bool {

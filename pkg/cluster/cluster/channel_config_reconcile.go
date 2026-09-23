@@ -260,6 +260,9 @@ func (s *Server) reconcileChannelConfig(ctx context.Context, key channelConfigKe
 		return nil
 	}
 	if owner == s.opts.ConfigOptions.NodeId {
+		// Foreground GetOrCreate may race this maintenance without sharing its
+		// channelKeyLock. saveChannelConfig fences both decisions by ConfVersion
+		// and slot read state; a losing decision is reloaded on the next attempt.
 		cfg, err = s.maintainChannelConfig(ctx, cfg)
 		if err != nil {
 			return err

@@ -16,20 +16,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestChannelConfigReconcileRPC(t *testing.T) {
+func newConfigRPCServers(t *testing.T, count int) ([]*Server, context.Context) {
+	t.Helper()
 	previous := trace.GlobalTrace
 	trace.SetGlobalTrace(trace.New(context.Background(), trace.NewOptions()))
 	t.Cleanup(func() { trace.SetGlobalTrace(previous) })
 	addresses := make(map[uint64]string)
-	for id := uint64(1); id <= 2; id++ {
+	for id := uint64(1); id <= uint64(count); id++ {
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		require.NoError(t, err)
 		addresses[id] = listener.Addr().String()
 		require.NoError(t, listener.Close())
 	}
 	var servers []*Server
-	for id := uint64(1); id <= 2; id++ {
-		config := newTestOptions(t, id, addresses, clusterconfig.WithSlotCount(2), clusterconfig.WithSlotMaxReplicaCount(2))
+	for id := uint64(1); id <= uint64(count); id++ {
+		config := newTestOptions(t, id, addresses, clusterconfig.WithSlotCount(uint32(count)), clusterconfig.WithSlotMaxReplicaCount(uint32(count)))
 		s := New(NewOptions(WithAddr("tcp://"+addresses[id]), WithConfigOptions(config), WithDataDir(t.TempDir()),
 			WithDBWKDbShardNum(1), WithDBSlotShardNum(1), WithDBWKDbMemTableSize(1<<20), WithDBSlotMemTableSize(1<<20)))
 		require.NoError(t, s.Start())
@@ -40,10 +41,15 @@ func TestChannelConfigReconcileRPC(t *testing.T) {
 		servers = append(servers, s)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
 	for _, s := range servers {
-		require.NoError(t, s.WaitAllSlotReady(ctx, 2))
+		require.NoError(t, s.WaitAllSlotReady(ctx, count))
 	}
+	return servers, ctx
+}
+
+func TestChannelConfigReconcileRPC(t *testing.T) {
+	servers, ctx := newConfigRPCServers(t, 2)
 	owner, leader := servers[0], servers[1]
 	var id string
 	for i := 0; i < 1000; i++ {
@@ -134,4 +140,42 @@ func TestChannelConfigReconcileRPC(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("cancelled election must not wait for the peer's independent RPC timeout")
 	}
+}
+
+func TestConfigElectionProbePreservesQuorumBeforeWorkerDeadline(t *testing.T) {
+	servers, ctx := newConfigRPCServers(t, 3)
+	slow := servers[2]
+	entered, release := make(chan struct{}, 4), make(chan struct{})
+	defer close(release)
+	slow.Route("/rpc/channel/lastLogInfo", func(c *wkserver.Context) {
+		entered <- struct{}{}
+		<-release
+		c.WriteErr(ErrConversationReadRetry)
+	})
+	owner := servers[0]
+	id := "slow-election"
+	for owner.cfgServer.SlotLeaderId(owner.getSlotId(id)) != 1 {
+		id += "x"
+	}
+	cfg, err := owner.GetOrCreateChannelClusterConfigFromSlotLeader(id, 2)
+	require.NoError(t, err)
+	require.Len(t, cfg.Replicas, 3)
+	workerCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	infos, err := owner.requestChannelLastLogInfos(workerCtx, cfg.Replicas, id, 2)
+	require.NoError(t, err, "the slow probe must expire before the enclosing worker")
+	require.NoError(t, workerCtx.Err())
+	require.Len(t, entered, 1, "the peer must accept the request and stall, not fail fast")
+	require.Len(t, infos, 2)
+	next := cfg.Clone()
+	changed, err := electChannelLeader(&next, infos)
+	require.NoError(t, err)
+	require.True(t, changed)
+	version, err := owner.saveChannelConfig(workerCtx, next)
+	require.NoError(t, err, "the same worker budget must still allow publication")
+	require.Greater(t, version, cfg.ConfVersion)
+	minority := cfg.Clone()
+	_, err = electChannelLeader(&minority, map[uint64]*ChannelLastLogInfoResponse{1: infos[1]})
+	require.ErrorIs(t, err, ErrConversationReadRetry, "partial results never bypass quorum")
+	require.Equal(t, cfg, minority)
 }
