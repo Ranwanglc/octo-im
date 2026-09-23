@@ -112,6 +112,49 @@ func TestConfigSaveRejectsChangeBetweenReadAndAdmission(t *testing.T) {
 	require.Equal(t, newer.Term, current.Term)
 }
 
+func TestConfigForegroundReloadsAfterConcurrentMaintenance(t *testing.T) {
+	var db *configDecisionDB
+	s, ctx := newConversationConsistencyServer(t, func(s *Server) {
+		db = &configDecisionDB{DB: s.db}
+		s.db = db
+	})
+	// Run the real worker path at a deterministic point in the foreground read.
+	s.configReconciler.stop()
+	cfg := consistencyConfig()
+	cfg.LeaderId, cfg.ConfVersion = 0, 0
+	version, err := s.saveChannelConfig(ctx, cfg)
+	require.NoError(t, err)
+	cfg.ConfVersion = version
+	var winner wkdb.ChannelClusterConfig
+	db.afterRead = func() {
+		require.NoError(t, s.reconcileChannelConfig(ctx, channelConfigKey{cfg.ChannelId, cfg.ChannelType}))
+		var err error
+		winner, err = s.loadConversationConfig(ctx, cfg.ChannelId, cfg.ChannelType)
+		require.NoError(t, err)
+		require.Greater(t, winner.ConfVersion, cfg.ConfVersion)
+		require.Equal(t, uint64(1), winner.LeaderId)
+		t.Logf("background maintenance on node 1 published version %d; foreground still holds version %d", winner.ConfVersion, cfg.ConfVersion)
+	}
+	db.armed.Store(true)
+	msg := consistencyMessage(1)
+	msg.MessageSeq = 0
+	sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	results, err := s.store.AppendMessages(sendCtx, cfg.ChannelId, cfg.ChannelType, []wkdb.Message{msg})
+	require.NoError(t, err, "a lost configuration race must reload before returning to the first send")
+	require.Len(t, results, 1)
+	require.Equal(t, uint64(1), results[0].Index)
+	current, err := s.loadConversationConfig(ctx, cfg.ChannelId, cfg.ChannelType)
+	require.NoError(t, err)
+	require.Equal(t, winner.ConfVersion, current.ConfVersion, "the losing election must not be replayed over the winner")
+	require.Equal(t, winner.Term, current.Term)
+	messages, err := s.db.LoadLastMsgs(cfg.ChannelId, cfg.ChannelType, 10)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	require.Equal(t, msg.MessageID, messages[0].MessageID)
+	require.Equal(t, msg.Payload, messages[0].Payload)
+}
+
 func TestConfigReconcileExpiredRPCDoesNotRequirePeer(t *testing.T) {
 	s := &Server{}
 	ctx, cancel := context.WithCancel(context.Background())

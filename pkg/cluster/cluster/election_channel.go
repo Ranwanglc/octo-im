@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
+	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"go.uber.org/zap"
@@ -16,6 +17,28 @@ import (
 )
 
 func (s *Server) getOrCreateChannelClusterConfigFromLocal(channelId string, channelType uint8) (wkdb.ChannelClusterConfig, error) {
+	ctx, cancel := context.WithTimeout(s.cancelCtx, 5*time.Second)
+	defer cancel()
+	for {
+		cfg, err := s.getOrCreateChannelClusterConfigAttempt(ctx, channelId, channelType)
+		if !errors.Is(err, raft.ErrConfigVersionStale) {
+			return cfg, err
+		}
+		// Background maintenance can win after the foreground read. Reload and
+		// recompute within the same budget; never replay the losing decision with
+		// a newer version or return this pre-proposal race to the first send.
+		select {
+		case <-ctx.Done():
+			return wkdb.EmptyChannelClusterConfig, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func (s *Server) getOrCreateChannelClusterConfigAttempt(ctx context.Context, channelId string, channelType uint8) (wkdb.ChannelClusterConfig, error) {
+	if err := ctx.Err(); err != nil {
+		return wkdb.EmptyChannelClusterConfig, err
+	}
 	// 获取频道槽领导
 	slotLeaderId, err := s.SlotLeaderIdOfChannel(channelId, channelType)
 	if err != nil {
@@ -39,7 +62,7 @@ func (s *Server) getOrCreateChannelClusterConfigFromLocal(channelId string, chan
 			return wkdb.EmptyChannelClusterConfig, err
 		}
 
-		version, err := s.saveChannelConfigTimeout(cfg)
+		version, err := s.saveChannelConfig(ctx, cfg)
 		if err != nil {
 			return wkdb.EmptyChannelClusterConfig, err
 		}
@@ -47,8 +70,6 @@ func (s *Server) getOrCreateChannelClusterConfigFromLocal(channelId string, chan
 		return cfg, nil
 	}
 
-	ctx, cancel := context.WithTimeout(s.cancelCtx, 5*time.Second)
-	defer cancel()
 	return s.maintainChannelConfig(ctx, cfg)
 }
 
