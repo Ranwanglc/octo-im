@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"math"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -46,35 +47,35 @@ func (s *Server) getOrCreateChannelClusterConfigFromLocal(channelId string, chan
 		return cfg, nil
 	}
 
-	propose := false
+	ctx, cancel := context.WithTimeout(s.cancelCtx, 5*time.Second)
+	defer cancel()
+	return s.maintainChannelConfig(ctx, cfg)
+}
 
-	// 视情况是否需要加入新的副本
-	changed, err := s.joinNewRepliceIfNeed(&cfg)
+// The slot owner maintains existing metadata even without a new send. Publish
+// only after election succeeds, then use the same version-fenced write as role
+// callbacks. A competing writer or ownership change makes this attempt retry.
+func (s *Server) maintainChannelConfig(ctx context.Context, current wkdb.ChannelClusterConfig) (wkdb.ChannelClusterConfig, error) {
+	if err := ctx.Err(); err != nil {
+		return current, err
+	}
+	cfg := current.Clone()
+	leaderChanged, err := s.switchLeaderIfNeed(ctx, &cfg)
 	if err != nil {
-		s.Foucs("joinNewRepliceIfNeed failed", zap.Error(err), zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.String("cfg", cfg.String()))
+		return current, err
 	}
-	if changed {
-		propose = true
-	}
-
-	// 视情况是否需要变更领导节点
-	changed, err = s.switchLeaderIfNeed(&cfg)
+	membersChanged, err := s.joinNewRepliceIfNeed(&cfg)
 	if err != nil {
-		s.Foucs("switchLeaderIfNeed failed", zap.Error(err), zap.String("channelId", channelId), zap.Uint8("channelType", channelType), zap.String("cfg", cfg.String()))
+		return current, err
 	}
-	if changed {
-		propose = true
+	if !leaderChanged && !membersChanged {
+		return current, nil
 	}
-
-	// 保存配置
-	if propose {
-		version, err := s.saveChannelConfigTimeout(cfg)
-		if err != nil {
-			return wkdb.EmptyChannelClusterConfig, err
-		}
-		cfg.ConfVersion = version
+	version, err := s.saveChannelConfig(ctx, cfg)
+	if err != nil {
+		return current, err
 	}
-
+	cfg.ConfVersion = version
 	return cfg, nil
 }
 
@@ -83,7 +84,7 @@ func (s *Server) joinNewRepliceIfNeed(cfg *wkdb.ChannelClusterConfig) (bool, err
 	if len(cfg.Replicas) >= int(cfg.ReplicaMaxCount) {
 		return false, nil
 	}
-	if len(cfg.Learners) > 0 {
+	if len(cfg.Learners) > 0 || cfg.MigrateFrom != 0 || cfg.MigrateTo != 0 {
 		return false, nil
 	}
 	allowVoteNodes := s.cfgServer.AllowVoteAndJoinedOnlineNodes()
@@ -121,7 +122,7 @@ func (s *Server) joinNewRepliceIfNeed(cfg *wkdb.ChannelClusterConfig) (bool, err
 }
 
 // 视情况是否需要变更领导节点
-func (s *Server) switchLeaderIfNeed(cfg *wkdb.ChannelClusterConfig) (bool, error) {
+func (s *Server) switchLeaderIfNeed(ctx context.Context, cfg *wkdb.ChannelClusterConfig) (bool, error) {
 	if cfg.LeaderId != 0 && s.cfgServer.NodeIsOnline(cfg.LeaderId) {
 		return false, nil
 	}
@@ -135,79 +136,51 @@ func (s *Server) switchLeaderIfNeed(cfg *wkdb.ChannelClusterConfig) (bool, error
 	}
 
 	// 获得在线的副本的最新日志信息
-	replicaLastLogInfos, err := s.requestChannelLastLogInfos(onlineRepics, cfg.ChannelId, cfg.ChannelType)
+	replicaLastLogInfos, err := s.requestChannelLastLogInfos(ctx, onlineRepics, cfg.ChannelId, cfg.ChannelType)
 	if err != nil {
 		s.Error("requestChannelLastLogInfos failed", zap.Error(err))
 		return false, err
 	}
-	if len(replicaLastLogInfos) == 0 {
-		s.Info("没有获取到频道的最新日志信息！！！", zap.String("channelId", cfg.ChannelId), zap.Uint8("channelType", cfg.ChannelType))
-		return false, errors.New("no replica last log infos")
+	return electChannelLeader(cfg, replicaLastLogInfos)
+}
+
+// Only current voting replicas count. Desired capacity and learners do not
+// change the quorum of the configuration being replaced. Log freshness, not a
+// peer's current term, chooses the candidate; the new term fences every report.
+func electChannelLeader(cfg *wkdb.ChannelClusterConfig, infos map[uint64]*ChannelLastLogInfoResponse) (bool, error) {
+	voters := make(map[uint64]struct{}, len(cfg.Replicas))
+	for _, id := range cfg.Replicas {
+		if id != 0 && !wkutil.ArrayContainsUint64(cfg.Learners, id) {
+			voters[id] = struct{}{}
+		}
 	}
-
-	// 合法的最小选举人数
-	quorum := int(cfg.ReplicaMaxCount/2) + 1
-	if len(replicaLastLogInfos) < quorum {
-		s.Foucs("no enough replica last log infos", zap.Int("quorum", quorum), zap.Int("replicaLastLogInfos", len(replicaLastLogInfos)))
-		return false, errors.New("no enough replica last log infos")
+	var leader uint64
+	var newest *ChannelLastLogInfoResponse
+	term, responses := cfg.Term, 0
+	for id := range voters {
+		info := infos[id]
+		if info == nil {
+			continue
+		}
+		responses++
+		term = max(term, info.Term, info.LogTerm)
+		if newest == nil || info.LogTerm > newest.LogTerm ||
+			info.LogTerm == newest.LogTerm && (info.LogIndex > newest.LogIndex || info.LogIndex == newest.LogIndex && id < leader) {
+			leader, newest = id, info
+		}
 	}
-
-	// 选举新的领导
-	newLeaderId, err := s.electionNewLeader(replicaLastLogInfos)
-	if err != nil {
-		s.Error("electionNewLeader failed", zap.Error(err))
-		return false, err
+	if responses < len(voters)/2+1 || leader == 0 || term == math.MaxUint32 {
+		return false, ErrConversationReadRetry
 	}
-
-	if newLeaderId == 0 {
-		s.Foucs("no new leader", zap.String("channelId", cfg.ChannelId), zap.Uint8("channelType", cfg.ChannelType), zap.Int("quorum", quorum), zap.Int("replicaLastLogInfos", len(replicaLastLogInfos)))
-		return false, errors.New("no new leader")
-	}
-	cfg.LeaderId = newLeaderId
-	cfg.Term = cfg.Term + 1
-
-	s.Info("switch leader success", zap.String("channelId", cfg.ChannelId), zap.Uint8("channelType", cfg.ChannelType), zap.Uint64("newLeaderId", newLeaderId))
-
+	cfg.LeaderId, cfg.Term = leader, term+1
 	return true, nil
 }
 
-func (s *Server) electionNewLeader(replicaLastLogInfos map[uint64]*ChannelLastLogInfoResponse) (uint64, error) {
-
-	var leaderId uint64 = 0     // 新的领导节点
-	var lastLogIndex uint64 = 0 // 最新日志索引
-	var lastLogTerm uint32 = 0  // 最新日志任期
-	var leaderTerm uint32 = 0   // 领导任期
-
-	for replicaId, candidate := range replicaLastLogInfos {
-		// 候选者的任期号（Term）不小于自身的当前任期号。
-		if candidate.Term < leaderTerm {
-			continue
-		}
-		// 候选者的最后日志条目的任期号较大，或者
-		// 如果任期号相同，候选者的日志更长。
-		if candidate.LogTerm > lastLogTerm {
-			leaderId = replicaId
-			lastLogIndex = candidate.LogIndex
-			lastLogTerm = candidate.LogTerm
-			leaderTerm = candidate.Term
-		} else if candidate.LogTerm == lastLogTerm {
-			if candidate.LogIndex > lastLogIndex {
-				leaderId = replicaId
-				lastLogIndex = candidate.LogIndex
-				lastLogTerm = candidate.LogTerm
-				leaderTerm = candidate.Term
-			}
-		}
-	}
-	return leaderId, nil
-
-}
-
 // 请求副本的最新日志信息
-func (s *Server) requestChannelLastLogInfos(replices []uint64, channelId string, channelType uint8) (map[uint64]*ChannelLastLogInfoResponse, error) {
-	timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*4)
+func (s *Server) requestChannelLastLogInfos(ctx context.Context, replices []uint64, channelId string, channelType uint8) (map[uint64]*ChannelLastLogInfoResponse, error) {
+	timeoutCtx, cancel := context.WithTimeout(ctx, time.Second*4)
 	defer cancel()
-	requestGroup, _ := errgroup.WithContext(timeoutCtx)
+	var requestGroup errgroup.Group
 
 	respMap := make(map[uint64]*ChannelLastLogInfoResponse)
 	respMapLock := &sync.Mutex{}
@@ -216,7 +189,7 @@ func (s *Server) requestChannelLastLogInfos(replices []uint64, channelId string,
 		nodeId := nodeId
 
 		if nodeId == s.opts.ConfigOptions.NodeId {
-			resp, err := s.getChannelLastLogInfo(channelId, channelType)
+			resp, err := s.getChannelLastLogInfo(timeoutCtx, channelId, channelType)
 			if err != nil {
 				s.Error("getChannelLastLogInfo failed", zap.Uint64("nodeId", nodeId), zap.Error(err))
 				continue
@@ -228,7 +201,7 @@ func (s *Server) requestChannelLastLogInfos(replices []uint64, channelId string,
 		}
 
 		requestGroup.Go(func() error {
-			resp, err := s.rpcClient.RequestChannelLastLogInfo(nodeId, channelId, channelType)
+			resp, err := s.rpcClient.RequestChannelLastLogInfo(timeoutCtx, nodeId, channelId, channelType)
 			if err != nil {
 				s.Error("RequestChannelLastLogInfo failed", zap.Uint64("nodeId", nodeId), zap.Error(err))
 				return err
@@ -242,7 +215,7 @@ func (s *Server) requestChannelLastLogInfos(replices []uint64, channelId string,
 
 	_ = requestGroup.Wait()
 
-	return respMap, nil
+	return respMap, ctx.Err()
 }
 
 // 创建一个频道的分布式配置

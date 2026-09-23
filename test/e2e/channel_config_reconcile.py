@@ -31,9 +31,14 @@ def main():
     parser.add_argument("--scenario", choices=["expand", "fresh", "upgrade", "repair"], default="expand")
     parser.add_argument("--expect-stale", action="store_true")
     parser.add_argument("--keep-data", action="store_true")
+    parser.add_argument("--failover", action="store_true", help="stop a channel leader and require complete reads without writes")
+    parser.add_argument("--no-post-expansion-send", action="store_true", help="require maintenance without any send after joining")
+    parser.add_argument("--recovery-seconds", type=float, default=45, help="bounded maintenance convergence window")
     args = parser.parse_args()
     if args.scenario in ("upgrade", "repair") and not args.legacy_binary:
         parser.error("upgrade/repair requires --legacy-binary")
+    if args.no_post_expansion_send and (args.expect_stale or args.scenario == "repair"):
+        parser.error("negative controls require the send that creates their stale configuration")
     if args.expect_stale and args.scenario != "expand":
         parser.error("--expect-stale requires --scenario expand")
     root = args.output.resolve()
@@ -194,11 +199,63 @@ def main():
             stale += bool(mismatch)
             if require_converged:
                 assert not migration and not mismatch, (channel, cfg, runtime)
-                if args.scenario == "fresh" or owner_id != cfg["learder_id"]:
-                    assert len(cfg["replicas"]) == 3, cfg
+                assert len(set(cfg["replicas"])) == 3, (channel, cfg)
+                assert cfg["replica_max_count"] == 3, cfg
         if args.scenario != "fresh":
             assert separated > 0, "expansion test must separate metadata and message leaders"
         return {"separated": separated, "stale": stale, "migrating": migrating}
+
+    def failover():
+        # Choose a node that actually leads channels; random placement must not
+        # let a fault test pass without exercising a channel leadership change.
+        slots = call(nodes[0], "/cluster/allslot")["body"]["data"]
+        owners = {slot["id"]: slot["leader_id"] for slot in slots}
+        before = {}
+        for channel in channels:
+            owner = next(n for n in nodes if n["id"] == owners[zlib.crc32(channel.encode()) % 64])
+            cfg = call(owner, f"/cluster/channels/{channel}/2/config")["body"]
+            assert len(set(cfg["replicas"])) == 3 and not cfg.get("learners"), cfg
+            before[channel] = cfg
+        victim = max(nodes, key=lambda n: sum(c["learder_id"] == n["id"] for c in before.values()))
+        affected = [channel for channel, cfg in before.items() if cfg["learder_id"] == victim["id"]]
+        assert affected
+        survivors = [n for n in nodes if n is not victim]
+        record("leader_stopped", node=victim["id"], affected=affected, configs=before)
+        stop([victim])
+        def slots_recovered():
+            for node in survivors:
+                response = call(node, "/cluster/allslot")
+                assert response["status"] == 200, response
+                slots = response["body"]["data"]
+                assert len(slots) == 64
+                assert all(s["leader_id"] in {n["id"] for n in survivors} for s in slots), slots
+        eventually(slots_recovered, seconds=args.recovery_seconds)
+        record("slots_recovered")
+        started = time.monotonic()
+        def recovered():
+            for node in survivors:
+                read(node)
+        # There is deliberately no control send, /start or manual wake here.
+        eventually(recovered, seconds=args.recovery_seconds)
+        recovery = time.monotonic() - started
+        for _ in range(10):
+            recovered()
+        slots = call(survivors[0], "/cluster/allslot")["body"]["data"]
+        owners = {slot["id"]: slot["leader_id"] for slot in slots}
+        after = {}
+        for channel in affected:
+            owner = next(n for n in survivors if n["id"] == owners[zlib.crc32(channel.encode()) % 64])
+            cfg = call(owner, f"/cluster/channels/{channel}/2/config")["body"]
+            assert cfg["learder_id"] != victim["id"] and cfg["term"] > before[channel]["term"], cfg
+            assert cfg["conf_version"] > before[channel]["conf_version"], cfg
+            assert set(cfg["replicas"]) == set(before[channel]["replicas"]), cfg
+            after[channel] = cfg
+        result = {"victim": victim["id"], "affected": affected, "recovered_without_write": True,
+                  "recovery_after_slots_seconds": recovery, "complete_reads_after_recovery": 22,
+                  "before_configs": before, "after_configs": after}
+        (root / "failover-summary.json").write_text(json.dumps(result, indent=2))
+        record("failover_verified", **result)
+        return result
 
     try:
         initial = nodes if args.scenario == "fresh" else nodes[:1]
@@ -221,7 +278,8 @@ def main():
             for node in nodes[1:]:
                 start(node, join_binary, joining=True)
             ready(nodes)
-            send_round("after-expansion")
+            if not args.no_post_expansion_send:
+                send_round("after-expansion")
         if args.expect_stale or args.scenario == "repair":
             time.sleep(3)
             broken = configs(False)
@@ -242,7 +300,7 @@ def main():
             configs(True)
             for node in nodes:
                 read(node)
-        eventually(complete, seconds=10)
+        eventually(complete, seconds=args.recovery_seconds)
         recovery_seconds = time.monotonic() - recovery_start
         latencies = [read(node) for _ in range(30) for node in nodes]
         result = {"scenario": args.scenario, "result": "pass", "channels": 12,
@@ -250,6 +308,8 @@ def main():
                   "recovery_check_seconds": recovery_seconds, "read_p50_ms": statistics.median(latencies)*1000,
                   "read_p95_ms": sorted(latencies)[int(len(latencies)*0.95)]*1000,
                   "read_max_ms": max(latencies)*1000, **configs(True)}
+        if args.failover:
+            result["failover"] = failover()
         (root / "summary.json").write_text(json.dumps(result, indent=2))
         record("verified", **result)
         print(json.dumps(result), flush=True)

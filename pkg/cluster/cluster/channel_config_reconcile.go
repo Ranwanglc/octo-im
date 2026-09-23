@@ -259,6 +259,12 @@ func (s *Server) reconcileChannelConfig(ctx context.Context, key channelConfigKe
 	if owner != s.opts.ConfigOptions.NodeId && cfg.LeaderId != s.opts.ConfigOptions.NodeId {
 		return nil
 	}
+	if owner == s.opts.ConfigOptions.NodeId {
+		cfg, err = s.maintainChannelConfig(ctx, cfg)
+		if err != nil {
+			return err
+		}
+	}
 	if !validConversationConfig(cfg, key.id, key.typ) {
 		return ErrConversationReadRetry
 	}

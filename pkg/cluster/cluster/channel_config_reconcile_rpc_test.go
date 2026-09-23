@@ -11,6 +11,7 @@ import (
 	rafttype "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/trace"
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
+	"github.com/WuKongIM/WuKongIM/pkg/wkserver"
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"github.com/stretchr/testify/require"
 )
@@ -103,4 +104,34 @@ func TestChannelConfigReconcileRPC(t *testing.T) {
 		Version: cfg.ConfVersion, Term: cfg.Term, Leader: 2, Replicas: []uint64{2},
 	})
 	require.ErrorIs(t, err, ErrConversationReadRetry, "a delayed remote callback cannot regress the recovered metadata")
+
+	info, err := owner.rpcClient.RequestChannelLastLogInfo(ctx, 2, id, 2)
+	require.NoError(t, err)
+	require.Equal(t, uint32(6), info.Term, "remote election probes include the recovered runtime/hard-state term")
+	entered, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	leader.Route("/rpc/channel/lastLogInfo", func(c *wkserver.Context) {
+		close(entered)
+		<-release
+		c.WriteErr(ErrConversationReadRetry)
+	})
+	probeCtx, stopProbe := context.WithCancel(ctx)
+	defer stopProbe()
+	done := make(chan error, 1)
+	go func() {
+		_, err := owner.requestChannelLastLogInfos(probeCtx, []uint64{2}, id, 2)
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("election probe did not reach peer")
+	}
+	stopProbe()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("cancelled election must not wait for the peer's independent RPC timeout")
+	}
 }
