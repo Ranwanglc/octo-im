@@ -157,9 +157,14 @@ func TestConfigElectionProbePreservesQuorumBeforeWorkerDeadline(t *testing.T) {
 	for owner.cfgServer.SlotLeaderId(owner.getSlotId(id)) != 1 {
 		id += "x"
 	}
-	cfg, err := owner.GetOrCreateChannelClusterConfigFromSlotLeader(id, 2)
-	require.NoError(t, err)
-	require.Len(t, cfg.Replicas, 3)
+	// Wait out initial slot/config publication before the measured failure.
+	// WaitAllSlotReady alone does not freeze concurrent startup transitions.
+	var cfg wkdb.ChannelClusterConfig
+	require.Eventually(t, func() bool {
+		var err error
+		cfg, err = owner.GetOrCreateChannelClusterConfigFromSlotLeader(id, 2)
+		return err == nil && len(cfg.Replicas) == 3
+	}, 5*time.Second, 10*time.Millisecond)
 	workerCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	infos, err := owner.requestChannelLastLogInfos(workerCtx, cfg.Replicas, id, 2)
