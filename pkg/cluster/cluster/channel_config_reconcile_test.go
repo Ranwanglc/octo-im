@@ -215,5 +215,5 @@ func TestConfigReadHintForDivergenceButNotNewerRuntime(t *testing.T) {
 	cfg.Learners = []uint64{2}
 	r.hintLaggingConfig(raftgroup.ReadState{}, cfg)
 	require.Equal(t, 3, hints)
-	require.False(t, conversationStateReady(raftgroup.ReadState{}, cfg))
+	require.True(t, conversationStateReady(raftgroup.ReadState{}, cfg), "an orphan learner alone must not block dormant reads")
 }

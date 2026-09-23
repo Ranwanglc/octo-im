@@ -197,10 +197,12 @@ func conversationStateReady(state raftgroup.ReadState, cfg wkdb.ChannelClusterCo
 		// Idle channels are automatically destroyed in this architecture. Reading
 		// their designated owner's durable tail must not wake them. A dormant
 		// channel in transfer cannot establish that it finished draining.
+		// An orphan learner without migration markers must not block that read:
+		// the learner may be gone and unable to finish promotion.
 		// Legacy storage does not persist a trustworthy committed bound across
 		// eviction/restart: dormant tails can include crash residue. See the
 		// compatibility note in docs/conversation-boundary-reads.md.
-		return len(cfg.Learners) == 0 && cfg.MigrateFrom == 0 && cfg.MigrateTo == 0
+		return cfg.MigrateFrom == 0 && cfg.MigrateTo == 0
 	}
 	return state.Ready && state.LeaderID == cfg.LeaderId && state.Term == cfg.Term && state.ConfigVersion == cfg.ConfVersion
 }
