@@ -18,6 +18,11 @@ import (
 
 func newConfigRPCServers(t *testing.T, count int) ([]*Server, context.Context) {
 	t.Helper()
+	return newConfigRPCServersWithSlots(t, count, count)
+}
+
+func newConfigRPCServersWithSlots(t *testing.T, count, slotCount int) ([]*Server, context.Context) {
+	t.Helper()
 	previous := trace.GlobalTrace
 	trace.SetGlobalTrace(trace.New(context.Background(), trace.NewOptions()))
 	t.Cleanup(func() { trace.SetGlobalTrace(previous) })
@@ -30,7 +35,7 @@ func newConfigRPCServers(t *testing.T, count int) ([]*Server, context.Context) {
 	}
 	var servers []*Server
 	for id := uint64(1); id <= uint64(count); id++ {
-		config := newTestOptions(t, id, addresses, clusterconfig.WithSlotCount(uint32(count)), clusterconfig.WithSlotMaxReplicaCount(uint32(count)))
+		config := newTestOptions(t, id, addresses, clusterconfig.WithSlotCount(uint32(slotCount)), clusterconfig.WithSlotMaxReplicaCount(uint32(count)))
 		s := New(NewOptions(WithAddr("tcp://"+addresses[id]), WithConfigOptions(config), WithDataDir(t.TempDir()),
 			WithDBWKDbShardNum(1), WithDBSlotShardNum(1), WithDBWKDbMemTableSize(1<<20), WithDBSlotMemTableSize(1<<20)))
 		require.NoError(t, s.Start())
@@ -43,7 +48,7 @@ func newConfigRPCServers(t *testing.T, count int) ([]*Server, context.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	t.Cleanup(cancel)
 	for _, s := range servers {
-		require.NoError(t, s.WaitAllSlotReady(ctx, count))
+		require.NoError(t, s.WaitAllSlotReady(ctx, slotCount))
 	}
 	return servers, ctx
 }
