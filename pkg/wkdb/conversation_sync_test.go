@@ -48,10 +48,14 @@ func (f *recoverySyncProbeFile) Sync() error {
 // synced. No target acknowledgement is allowed at that point. The committed
 // Raft entry is replayed after reopening, as it would be with no applied ACK.
 func TestConversationCrossShardPartialSyncReplay(t *testing.T) {
-	for _, relationFirst := range []bool{false, true} {
+	for _, scenario := range []struct{ relationFirst, adoption bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
+		relationFirst := scenario.relationFirst
 		name := "user-first"
 		if relationFirst {
 			name = "relation-first"
+		}
+		if scenario.adoption {
+			name += "-adoption"
 		}
 		t.Run(name, func(t *testing.T) {
 			strict := vfs.NewStrictMem()
@@ -68,6 +72,15 @@ func TestConversationCrossShardPartialSyncReplay(t *testing.T) {
 			}
 			effect := ConversationEffect{UID: uid, ChannelID: channel, ChannelType: 2,
 				Version: 1, ConversationID: 7, CreatedAt: time.Now().UnixNano()}
+			if scenario.adoption {
+				at := time.Now().Add(-time.Hour)
+				require.NoError(t, db.AddOrUpdateConversations([]Conversation{{Id: 3, Uid: uid, ChannelId: channel, ChannelType: 2, Type: ConversationTypeChat, ReadToMsgSeq: 4, CreatedAt: &at, UpdatedAt: &at}}))
+				require.NoError(t, db.UpdateConversationDeletedAtMsgSeq(uid, channel, 2, 20))
+				// Keep the pre-crash reverse relation absent to observe which
+				// shard really became durable in this partial-prefix test.
+				require.NoError(t, db.deleteConversationLocalUserRelation(channel, 2, uid))
+				effect.PreserveExisting = true
+			}
 			done := make(chan error, 1)
 			fs.armed.Store(true)
 			go func() { done <- db.ApplyConversationEffects([]ConversationEffect{effect}) }()
@@ -138,6 +151,10 @@ func TestConversationCrossShardPartialSyncReplay(t *testing.T) {
 			conversation, err := reopened.GetConversation(uid, channel, 2)
 			require.NoError(t, err)
 			require.Equal(t, uint64(7), conversation.Id)
+			if scenario.adoption {
+				require.EqualValues(t, 20, conversation.DeletedAtMsgSeq)
+				require.EqualValues(t, 4, conversation.ReadToMsgSeq)
+			}
 			lifecycle, found, err := reopened.ConversationLifecycle(uid, channel, 2)
 			require.NoError(t, err)
 			require.True(t, found)

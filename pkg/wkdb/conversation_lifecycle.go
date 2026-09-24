@@ -275,7 +275,7 @@ func (wk *wukongDB) applyConversationEffectBatch(effects []ConversationEffect) e
 				conversation = retained
 				conversation.Id = effect.ConversationID
 			}
-			if err := wk.writeConversation(conversation, staged); err != nil {
+			if err := wk.writeLifecycleConversation(conversation, staged); err != nil {
 				return err
 			}
 		}
@@ -465,7 +465,7 @@ func (wk *wukongDB) applyConversationEffect(e ConversationEffect) error {
 				c = retained
 				c.Id = e.ConversationID
 			}
-			if err := wk.writeConversation(c, staged); err != nil {
+			if err := wk.writeLifecycleConversation(c, staged); err != nil {
 				return err
 			}
 		}
@@ -510,5 +510,20 @@ func (wk *wukongDB) applyConversationEffect(e ConversationEffect) error {
 		return err
 	}
 	wk.lifecycleCacheVersion[key.HashWithString(e.UID)%64].Add(1)
+	return nil
+}
+
+// Adoption replaces the row identity. The ordinary writer intentionally leaves
+// the deletion boundary untouched on updates, so copy it explicitly when
+// reconstructing a retained row. Keep it in the same durable lifecycle batch.
+func (wk *wukongDB) writeLifecycleConversation(c Conversation, batch *Batch) error {
+	if err := wk.writeConversation(c, batch); err != nil {
+		return err
+	}
+	if c.DeletedAtMsgSeq != 0 {
+		value := make([]byte, 8)
+		wk.endian.PutUint64(value, c.DeletedAtMsgSeq)
+		batch.Set(key.NewConversationColumnKey(c.Uid, c.Id, key.TableConversation.Column.DeletedAtMsgSeq), value)
+	}
 	return nil
 }
