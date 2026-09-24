@@ -105,7 +105,14 @@ func (s *Server) joinNewRepliceIfNeed(cfg *wkdb.ChannelClusterConfig) (bool, err
 	if len(cfg.Replicas) >= int(cfg.ReplicaMaxCount) {
 		return false, nil
 	}
-	if len(cfg.Learners) > 0 || cfg.MigrateFrom != 0 || cfg.MigrateTo != 0 {
+	// An interrupted expansion can leave equal, nonzero migration endpoints
+	// after its learner disappeared. If the target is not a replica either,
+	// no member can complete that migration. Select eligible learners below and
+	// replace the stale markers in the same version-fenced metadata write.
+	// Preserve real learners, transfers, partial markers and existing replicas.
+	orphanedExpansion := len(cfg.Learners) == 0 && cfg.MigrateFrom != 0 &&
+		cfg.MigrateFrom == cfg.MigrateTo && !wkutil.ArrayContainsUint64(cfg.Replicas, cfg.MigrateTo)
+	if len(cfg.Learners) > 0 || (cfg.MigrateFrom != 0 || cfg.MigrateTo != 0) && !orphanedExpansion {
 		return false, nil
 	}
 	allowVoteNodes := s.cfgServer.AllowVoteAndJoinedOnlineNodes()
