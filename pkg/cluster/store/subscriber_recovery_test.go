@@ -25,6 +25,7 @@ type recoverySlots struct {
 	store       *Store
 	locks       [8]sync.Mutex
 	indexes     [8]uint64
+	logs        [8][]types.Log
 	leader      atomic.Uint64
 	failTargets atomic.Bool
 	loseReply   atomic.Bool
@@ -75,7 +76,9 @@ func (s *recoverySlots) ProposeUntilAppliedTimeout(ctx context.Context, slot uin
 	s.locks[slot].Lock()
 	defer s.locks[slot].Unlock()
 	s.indexes[slot]++
-	err := s.store.ApplySlotLogs(slot, []types.Log{{Index: s.indexes[slot], Data: data}})
+	log := types.Log{Index: s.indexes[slot], Data: data}
+	s.logs[slot] = append(s.logs[slot], log)
+	err := s.store.ApplySlotLogs(slot, []types.Log{log})
 	if err == nil && cmd.CmdType == CMDConversationEffects && s.loseReply.CompareAndSwap(true, false) {
 		return nil, context.DeadlineExceeded
 	}
@@ -504,16 +507,16 @@ func completeRecoveryConcurrently(s *Store, receipts []wkdb.SubscriberReceipt) <
 
 func TestRecoveryPausedAfterRestartFencesOldPendingWork(t *testing.T) {
 	dir := t.TempDir()
+	// This transport has no Raft log storage. Retain its committed log indexes
+	// separately, as real Raft storage does, instead of treating the business
+	// DB's legacy replay boundary as the complete Raft applied index.
+	var logIndexes [8]uint64
 	open := func() (*Store, *recoverySlots) {
 		db := wkdb.NewWukongDB(wkdb.NewOptions(wkdb.WithDir(dir), wkdb.WithNodeId(1), wkdb.WithShardNum(2), wkdb.WithMemTableSize(1<<20)))
 		require.NoError(t, db.Open())
 		slots := &recoverySlots{}
 		slots.leader.Store(1)
-		for i := range slots.indexes {
-			index, err := db.SlotAppliedIndex(uint32(i))
-			require.NoError(t, err)
-			slots.indexes[i] = index
-		}
+		slots.indexes = logIndexes
 		s := New(NewOptions(WithNodeId(1), WithDB(db), WithSlot(slots)))
 		slots.store = s
 		return s, slots
@@ -530,6 +533,7 @@ func TestRecoveryPausedAfterRestartFencesOldPendingWork(t *testing.T) {
 	require.NoError(t, pageErr)
 	require.NoError(t, err)
 	require.True(t, found)
+	logIndexes = slots.indexes
 	s.Stop()
 	require.NoError(t, s.DB().Close())
 	s, _ = open()

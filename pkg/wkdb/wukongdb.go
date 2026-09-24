@@ -137,6 +137,9 @@ func (wk *wukongDB) defaultPebbleOptions() *pebble.Options {
 	return &pebble.Options{
 		Levels:             lopts,
 		FormatMajorVersion: pebble.FormatNewest,
+		// Share WAL syncs from concurrent metadata and message writers without
+		// acknowledging any synchronous write before its durability barrier.
+		WALMinSyncInterval: func() time.Duration { return 5 * time.Millisecond },
 		// 控制写缓冲区的大小。较大的写缓冲区可以减少磁盘写入次数，但会占用更多内存。
 		MemTableSize: wk.opts.MemTableSize,
 		// 当队列中的MemTables的大小超过 MemTableStopWritesThreshold*MemTableSize 时，将停止写入，

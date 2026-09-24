@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,69 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
 	"github.com/stretchr/testify/require"
 )
+
+type recoveryOnlyProgressDB struct{ wkdb.DB }
+
+func (d *recoveryOnlyProgressDB) SetSlotAppliedIndex(uint32, uint64) error {
+	return errors.New("recovery must use its atomic fence, not the legacy checkpoint")
+}
+
+func TestRecoveryReplaysAfterReopenWithoutLegacyCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	open := func() (*Store, *recoverySlots) {
+		db := wkdb.NewWukongDB(wkdb.NewOptions(wkdb.WithDir(dir), wkdb.WithShardNum(2), wkdb.WithMemTableSize(1<<20)))
+		require.NoError(t, db.Open())
+		slots := &recoverySlots{}
+		slots.leader.Store(1)
+		s := New(NewOptions(WithNodeId(1), WithDB(&recoveryOnlyProgressDB{db}), WithSlot(slots)))
+		slots.store = s
+		return s, slots
+	}
+	s, slots := open()
+	cfg := recoveryConfig()
+	cfg.Paused = true
+	require.NoError(t, s.StartSubscriberRecovery(cfg, func(context.Context, wkdb.SubscriberWork) error { return nil }))
+	var receipts []wkdb.SubscriberReceipt
+	for i, mode := range []string{"add", "remove", "add", "remove"} {
+		r, err := s.SubmitSubscriberOperation(context.Background(), wkdb.SubscriberOperation{
+			OperationID: fmt.Sprintf("op-%d", i), ChannelID: "replay-group", ChannelType: 2,
+			Mode: mode, UIDs: []string{"a", "b"},
+		})
+		require.NoError(t, err)
+		r, err = s.CompleteSubscriberOperation(context.Background(), r)
+		require.NoError(t, err)
+		require.Equal(t, "complete", r.State)
+		receipts = append(receipts, r)
+	}
+	s.Stop()
+	require.NoError(t, s.DB().Close())
+	restarted, _ := open()
+	defer func() { restarted.Stop(); require.NoError(t, restarted.DB().Close()) }()
+	for slot, logs := range slots.logs {
+		index, err := restarted.DB().SlotAppliedIndex(uint32(slot))
+		require.NoError(t, err)
+		require.Zero(t, index)
+		// Simulate losing the separate Raft applied watermark. Replay every
+		// source operation, target effect and completion checkpoint from disk.
+		require.NoError(t, restarted.ApplySlotLogs(uint32(slot), logs))
+	}
+	members, err := restarted.DB().GetSubscribers("replay-group", 2)
+	require.NoError(t, err)
+	require.Empty(t, members)
+	for _, uid := range []string{"a", "b"} {
+		_, err := restarted.DB().GetConversation(uid, "replay-group", 2)
+		require.ErrorIs(t, err, wkdb.ErrNotFound)
+	}
+	backlog, err := restarted.DB().SubscriberBacklog()
+	require.NoError(t, err)
+	require.Empty(t, backlog)
+	for _, want := range receipts {
+		got, found, err := restarted.DB().GetSubscriberReceipt(want.ChannelID, want.ChannelType, want.OperationID)
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, want, got, "replay must not reopen or double-count completed work")
+	}
+}
 
 type progressFailureDB struct {
 	wkdb.DB

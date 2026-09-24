@@ -25,6 +25,10 @@ type Options struct {
 	RPC icluster.RPC
 	// OnApply 应用日志回调
 	OnApply func(slotId uint32, logs []types.Log) error
+	// ReplaySafeApply promises that OnApply durably commits both its effects
+	// and replay protection before returning. Only then may the separate Raft
+	// applied cursor lag on a crash. Log append durability is never relaxed.
+	ReplaySafeApply bool
 	// ApplyErrorRetry enables tick-paced retries for state-machine apply errors.
 	ApplyErrorRetry bool
 
@@ -89,6 +93,16 @@ func WithSlotCount(slotCount uint32) Option {
 func WithOnApply(onApply func(slotId uint32, logs []types.Log) error) Option {
 	return func(o *Options) {
 		o.OnApply = onApply
+		o.ReplaySafeApply = false
+	}
+}
+
+// WithReplaySafeOnApply is for a state machine with durable per-entry replay
+// protection. Arbitrary callbacks must use WithOnApply instead.
+func WithReplaySafeOnApply(onApply func(slotId uint32, logs []types.Log) error) Option {
+	return func(o *Options) {
+		o.OnApply = onApply
+		o.ReplaySafeApply = true
 	}
 }
 

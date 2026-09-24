@@ -3,6 +3,7 @@ package wkdb
 import (
 	"errors"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/WuKongIM/WuKongIM/pkg/wkdb/key"
@@ -198,9 +199,10 @@ func (wk *wukongDB) ApplyConversationEffects(effects []ConversationEffect) error
 	return wk.applyConversationEffectBatch(effects)
 }
 
-// applyConversationEffectBatch keeps the three crash-safe phases used by the
-// single-effect path, but commits all independent effects in a page together
-// per physical shard. A retry remains safe after any partially committed phase.
+// applyConversationEffectBatch syncs the user rows, lifecycle and reverse
+// relations together before writing RelationDone or acknowledging the target
+// Raft entry. Different physical shards may finish in either order: the entry
+// remains unapplied until all are durable, and replay repairs either prefix.
 func (wk *wukongDB) applyConversationEffectBatch(effects []ConversationEffect) error {
 	uids := make([]string, len(effects))
 	for i := range effects {
@@ -292,27 +294,17 @@ func (wk *wukongDB) applyConversationEffectBatch(effects []ConversationEffect) e
 		stageRows[dbIndex] = append(stageRows[dbIndex], effect)
 		pending = append(pending, pendingEffect{effect: effect, userDB: dbIndex})
 	}
-	if err := commitRecoveryBatches(stageBatches, wk.sync, func(shard uint32) {
-		for _, effect := range stageRows[shard] {
-			wk.lifecycleCacheVersion[key.HashWithString(effect.UID)%64].Add(1)
-			wk.conversationCache.InvalidateUserConversations(effect.UID)
-		}
-	}); err != nil {
-		return err
-	}
 	if len(pending) == 0 {
 		return nil
 	}
 
-	relationBatches := make(map[uint32]*pebble.Batch)
-	defer closeRecoveryBatches(relationBatches)
 	for _, item := range pending {
 		effect := item.effect
 		dbIndex := wk.GetChannelShardIndex(effect.ChannelID, effect.ChannelType)
-		batch := relationBatches[dbIndex]
+		batch := stageBatches[dbIndex]
 		if batch == nil {
 			batch = wk.shardDBById(dbIndex).NewBatch()
-			relationBatches[dbIndex] = batch
+			stageBatches[dbIndex] = batch
 		}
 		relationKey := key.NewConversationLocalUserKey(effect.ChannelID, effect.ChannelType, effect.UID)
 		var err error
@@ -325,7 +317,15 @@ func (wk *wukongDB) applyConversationEffectBatch(effects []ConversationEffect) e
 			return err
 		}
 	}
-	if err := commitRecoveryBatches(relationBatches, wk.sync, nil); err != nil {
+	// Same-shard rows and relations use one atomic batch. Cross-shard writes
+	// share one wait-all barrier instead of two serial fsync rounds. On a
+	// partial failure, RelationDone stays false and the target is not ACKed.
+	if err := commitRecoveryBatches(stageBatches, wk.sync, func(shard uint32) {
+		for _, effect := range stageRows[shard] {
+			wk.lifecycleCacheVersion[key.HashWithString(effect.UID)%64].Add(1)
+			wk.conversationCache.InvalidateUserConversations(effect.UID)
+		}
+	}); err != nil {
 		return err
 	}
 
@@ -366,16 +366,38 @@ func commitRecoveryBatches(batches map[uint32]*pebble.Batch, options *pebble.Wri
 		shards = append(shards, int(shard))
 	}
 	sort.Ints(shards)
-	for _, value := range shards {
-		shard := uint32(value)
-		if err := batches[shard].Commit(options); err != nil {
-			return err
+	// A recovery page is bounded by MaxConversationEffects. Each physical
+	// shard owns a separate batch; only independent shards in this phase
+	// may commit concurrently. Later lifecycle phases still await every sync.
+	errs := make([]error, len(shards))
+	if options.Sync && len(shards) > 1 {
+		var wg sync.WaitGroup
+		for i, shard := range shards {
+			wg.Add(1)
+			go func(i, shard int) {
+				defer wg.Done()
+				errs[i] = batches[uint32(shard)].Commit(options)
+			}(i, shard)
 		}
-		if committed != nil {
-			committed(shard)
+		wg.Wait()
+	} else {
+		for i, shard := range shards {
+			errs[i] = batches[uint32(shard)].Commit(options)
 		}
 	}
-	return nil
+	// Invalidate every successfully committed shard even on partial failure.
+	// All writes have finished before the caller may close the batches.
+	var firstErr error
+	for i, shard := range shards {
+		if errs[i] != nil {
+			if firstErr == nil {
+				firstErr = errs[i]
+			}
+		} else if committed != nil {
+			committed(uint32(shard))
+		}
+	}
+	return firstErr
 }
 
 func (wk *wukongDB) applyConversationEffectsIndividually(effects []ConversationEffect) error {

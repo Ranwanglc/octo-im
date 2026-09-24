@@ -134,7 +134,9 @@ func New(opts *Options) *Server {
 		slot.WithDataDir(path.Join(opts.DataDir, "cluster")),
 		slot.WithTransport(opts.SlotTransport),
 		slot.WithNode(s.cfgServer),
-		slot.WithOnApply(s.slotApplyLogs),
+		// Store commits legacy replay watermarks or atomic recovery fences
+		// before returning; replaying a lost Raft apply cursor is therefore safe.
+		slot.WithReplaySafeOnApply(s.slotApplyLogs),
 		slot.WithBeforePropose(s.checkSubscriberProposal),
 		slot.WithApplyErrorRetry(true),
 		slot.WithOnSaveConfig(s.onSaveSlotConfig),

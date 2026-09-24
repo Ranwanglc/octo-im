@@ -69,15 +69,16 @@ func (s *Store) ApplySlotLogs(slotId uint32, logs []types.Log) error {
 			i++
 		}
 		applied = logs[i-1].Index
-		// Recovery entries have transactional version/progress fences. They can
-		// replay a successful prefix, so share its checkpoint at the batch end.
+		// Recovery entries have transactional version/progress fences. Their
+		// successful prefix can replay even after a later command fails. The
+		// Raft log and business effects are already durable before the applied
+		// response. These fences also protect replay if the separate Raft apply
+		// cursor is lost; another watermark sync adds no protection here.
 		// Legacy entries must checkpoint individually before any later entry:
 		// replaying an older legacy write after a newer write is not generally safe.
 		switch cmd.CmdType {
 		case CMDSubscriberOperation, CMDConversationEffects, CMDSubscriberCheckpoint:
-			if i < len(logs) {
-				continue
-			}
+			continue
 		}
 		if err := s.wdb.SetSlotAppliedIndex(slotId, applied); err != nil {
 			return err

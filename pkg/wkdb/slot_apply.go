@@ -1,9 +1,11 @@
 package wkdb
 
-// SlotApplyDB records the successfully applied prefix independently of the
-// Raft storage batch. Callers must serialize one slot and must not advance past
-// an unsuccessful command. The current command still needs to be idempotent:
-// a crash can occur between its commit and this checkpoint.
+// SlotApplyDB records the legacy-command replay boundary independently of the
+// Raft storage batch. Recovery commands carry their own transactional fences,
+// so this boundary may lag the Raft applied index. Callers must serialize one
+// slot and must not advance past an unsuccessful command. The current command
+// still needs to be idempotent: a crash can occur between its commit and this
+// checkpoint.
 type SlotApplyDB interface {
 	SlotAppliedIndex(slot uint32) (uint64, error)
 	SetSlotAppliedIndex(slot uint32, index uint64) error
