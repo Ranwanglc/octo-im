@@ -79,9 +79,9 @@ func (p *PebbleShardLogStorage) defaultPebbleOptions() *pebble.Options {
 		Levels:             lopts,
 		FormatMajorVersion: pebble.FormatNewest,
 		// Coalesce concurrent slot appends and applied-index writes. With the
-		// default 8 shards this bounds steady WAL syncs to 1600/s; callers
+		// default 8 shards this bounds steady WAL syncs to 400/s; callers
 		// still wait for the shared durability barrier before acknowledging.
-		WALMinSyncInterval: func() time.Duration { return 5 * time.Millisecond },
+		WALMinSyncInterval: func() time.Duration { return 20 * time.Millisecond },
 		// This is per physical shard. Pebble also preallocates each WAL at
 		// 110% of this size, including its small startup memtables. A 128MiB
 		// table reserved nearly 1GiB of WAL space per shard before the first
