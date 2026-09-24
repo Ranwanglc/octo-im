@@ -106,6 +106,8 @@ const (
 	CMDSubscriberOperation
 	CMDConversationEffects
 	CMDSubscriberCheckpoint
+	// Protocol 4: receiver-fenced authoritative business membership snapshot.
+	CMDSubscriberReconcile
 )
 
 func (c CMDType) Uint16() uint16 {
@@ -114,6 +116,8 @@ func (c CMDType) Uint16() uint16 {
 
 func (c CMDType) String() string {
 	switch c {
+	case CMDSubscriberReconcile:
+		return "CMDSubscriberReconcile"
 	case CMDSubscriberOperation:
 		return "CMDSubscriberOperation"
 	case CMDConversationEffects:

@@ -28,6 +28,8 @@ func newRpcServer(s *Server) *rpcServer {
 
 func (r *rpcServer) setRoutes() {
 	r.s.netServer.Route(subscriberCapabilityPath, func(c *wkserver.Context) { c.Write([]byte(fmt.Sprint(subscriberProtocolVersion))) })
+	r.s.netServer.Route(subscriberRevisionCapabilityPath, func(c *wkserver.Context) { c.Write([]byte(fmt.Sprint(subscriberRevisionProtocolVersion))) })
+	r.s.netServer.Route(subscriberRevisionActivationPath, r.handleSubscriberRevisionActivation)
 	r.s.netServer.Route(subscriberActivationPath, r.handleSubscriberActivation)
 	// 频道提案
 	r.s.netServer.Route("/rpc/channel/propose", r.handleChannelPropose)
@@ -346,8 +348,9 @@ func (r *rpcServer) handleClusterJoin(c *wkserver.Context) {
 		c.Write(data)
 		return
 	}
-	if (r.s.opts.SubscriberRecoveryEnabled || r.s.db.SubscriberRecoveryActive()) && req.SubscriberProtocol < subscriberProtocolVersion {
-		c.WriteErr(fmt.Errorf("joining node must support subscriber protocol %d", subscriberProtocolVersion))
+	required := requiredSubscriberJoinProtocol(r.s.cfgServer.SubscriberNodes())
+	if (r.s.opts.SubscriberRecoveryEnabled || r.s.db.SubscriberRecoveryActive() || required > subscriberProtocolVersion) && req.SubscriberProtocol < required {
+		c.WriteErr(fmt.Errorf("joining node must support subscriber protocol %d", required))
 		return
 	}
 
@@ -381,6 +384,11 @@ func (r *rpcServer) handleClusterJoin(c *wkserver.Context) {
 	if err != nil {
 		r.Error("proposeJoin failed", zap.Error(err))
 		c.WriteErr(err)
+		return
+	}
+
+	if required := requiredSubscriberJoinProtocol(r.s.cfgServer.SubscriberNodes()); required > subscriberProtocolVersion && required > req.SubscriberProtocol {
+		c.WriteErr(fmt.Errorf("subscriber protocol activated while node join was pending; upgrade the joining node"))
 		return
 	}
 

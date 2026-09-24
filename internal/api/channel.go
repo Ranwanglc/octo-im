@@ -40,6 +40,7 @@ func (ch *channel) route(r *wkhttp.WKHttp) {
 	r.POST("/channel/delete", ch.limitSubscriberRequests(ch.channelDelete))  // 删除频道
 
 	r.POST("/channel/subscriber_operation", ch.subscriberOperationStatus)
+	r.POST("/channel/subscriber_reconcile", ch.reconcileSubscribers)
 	r.GET("/channel/subscriber_recovery", ch.subscriberRecoveryStatus)
 
 	//################### 订阅者 ###################// 删除频道

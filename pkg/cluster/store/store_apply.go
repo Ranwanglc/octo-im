@@ -33,12 +33,37 @@ func (s *Store) ApplySlotLogs(slotId uint32, logs []types.Log) error {
 			return &PermanentApplyError{Err: err}
 		}
 		switch cmd.CmdType {
-		case CMDSubscriberOperation, CMDSubscriberCheckpoint:
+		case CMDSubscriberOperation, CMDSubscriberCheckpoint, CMDSubscriberReconcile:
 			cmds, versions, next, err := decodeContiguousSubscriberSourceCommands(logs, i)
 			if err != nil {
 				return err
 			}
 			if err = s.applySubscriberRecoveryCommands(slotId, cmds, versions); err != nil {
+				return err
+			}
+			i = next
+		case CMDUpdateChannelInfo:
+			// Bound one atomic metadata unit and never move updates across
+			// membership, deletion, or other command types.
+			cmds, _, next, err := decodeContiguousCommands(logs[:min(len(logs), i+256)], i, CMDUpdateChannelInfo)
+			if err != nil {
+				return err
+			}
+			infos := make([]wkdb.ChannelInfo, 0, len(cmds))
+			for _, entry := range cmds {
+				info, err := entry.DecodeChannelInfo()
+				if err != nil {
+					return &PermanentApplyError{Err: err}
+				}
+				managed, err := s.wdb.SubscriberBusinessManaged(info.ChannelId, info.ChannelType)
+				if err != nil {
+					return err
+				}
+				if !managed {
+					infos = append(infos, info)
+				}
+			}
+			if err := s.wdb.UpdateChannelInfoBatch(infos); err != nil {
 				return err
 			}
 			i = next
@@ -77,7 +102,7 @@ func (s *Store) ApplySlotLogs(slotId uint32, logs []types.Log) error {
 		// Legacy entries must checkpoint individually before any later entry:
 		// replaying an older legacy write after a newer write is not generally safe.
 		switch cmd.CmdType {
-		case CMDSubscriberOperation, CMDConversationEffects, CMDSubscriberCheckpoint:
+		case CMDSubscriberOperation, CMDConversationEffects, CMDSubscriberCheckpoint, CMDSubscriberReconcile:
 			continue
 		}
 		if err := s.wdb.SetSlotAppliedIndex(slotId, applied); err != nil {
@@ -96,7 +121,7 @@ func decodeContiguousSubscriberSourceCommands(logs []types.Log, start int) ([]*C
 		if err := cmd.Unmarshal(logs[i].Data); err != nil {
 			return nil, nil, start, &PermanentApplyError{Err: err}
 		}
-		if cmd.CmdType != CMDSubscriberOperation && cmd.CmdType != CMDSubscriberCheckpoint {
+		if cmd.CmdType != CMDSubscriberOperation && cmd.CmdType != CMDSubscriberCheckpoint && cmd.CmdType != CMDSubscriberReconcile {
 			break
 		}
 		cmds = append(cmds, cmd)
@@ -181,7 +206,7 @@ func (s *Store) applyCMDForSlot(slot uint32, cmd *CMD, index uint64) error {
 			return &PermanentApplyError{Err: err}
 		}
 		return s.wdb.AppendMessageEventForSlot(slot, index, event)
-	case CMDSubscriberOperation, CMDConversationEffects, CMDSubscriberCheckpoint:
+	case CMDSubscriberOperation, CMDConversationEffects, CMDSubscriberCheckpoint, CMDSubscriberReconcile:
 		return s.applySubscriberRecovery(slot, cmd, index)
 	default:
 		return s.applyCMD(cmd, index)
@@ -400,6 +425,10 @@ func (s *Store) handleAddSubscribers(cmd *CMD) error {
 		s.Error("decode subscribers err", zap.Error(err), zap.String("channelID", channelId), zap.Uint8("channelType", channelType), zap.ByteString("data", cmd.Data))
 		return &PermanentApplyError{Err: err}
 	}
+	if managed, err := s.wdb.SubscriberBusinessManaged(channelId, channelType); err != nil || managed {
+		return err
+	}
+
 	return s.wdb.AddSubscribers(channelId, channelType, members)
 }
 
@@ -408,6 +437,10 @@ func (s *Store) handleRemoveSubscribers(cmd *CMD) error {
 	if err != nil {
 		return &PermanentApplyError{Err: err}
 	}
+	if managed, err := s.wdb.SubscriberBusinessManaged(channelId, channelType); err != nil || managed {
+		return err
+	}
+
 	return s.wdb.RemoveSubscribers(channelId, channelType, subscribers)
 }
 
@@ -448,6 +481,10 @@ func (s *Store) handleAddChannelInfo(cmd *CMD) error {
 	if err != nil {
 		return &PermanentApplyError{Err: err}
 	}
+	if managed, err := s.wdb.SubscriberBusinessManaged(channelInfo.ChannelId, channelInfo.ChannelType); err != nil || managed {
+		return err
+	}
+
 	_, err = s.wdb.AddChannel(channelInfo)
 	return err
 }
@@ -457,6 +494,10 @@ func (s *Store) handleUpdateChannel(cmd *CMD) error {
 	if err != nil {
 		return &PermanentApplyError{Err: err}
 	}
+	if managed, err := s.wdb.SubscriberBusinessManaged(channelInfo.ChannelId, channelInfo.ChannelType); err != nil || managed {
+		return err
+	}
+
 	err = s.wdb.UpdateChannel(channelInfo)
 	return err
 }
@@ -466,6 +507,10 @@ func (s *Store) handleRemoveAllSubscriber(cmd *CMD) error {
 	if err != nil {
 		return &PermanentApplyError{Err: err}
 	}
+	if managed, err := s.wdb.SubscriberBusinessManaged(channelId, channelType); err != nil || managed {
+		return err
+	}
+
 	return s.wdb.RemoveAllSubscriber(channelId, channelType)
 }
 
@@ -474,6 +519,10 @@ func (s *Store) handleDeleteChannel(cmd *CMD) error {
 	if err != nil {
 		return &PermanentApplyError{Err: err}
 	}
+	if managed, err := s.wdb.SubscriberBusinessManaged(channelId, channelType); err != nil || managed {
+		return err
+	}
+
 	return s.wdb.DeleteChannel(channelId, channelType)
 }
 
@@ -482,6 +531,10 @@ func (s *Store) handleAddDenylist(cmd *CMD) error {
 	if err != nil {
 		return &PermanentApplyError{Err: err}
 	}
+	if managed, err := s.wdb.SubscriberBusinessManaged(channelId, channelType); err != nil || managed {
+		return err
+	}
+
 	return s.wdb.AddDenylist(channelId, channelType, members)
 }
 
@@ -490,6 +543,10 @@ func (s *Store) handleRemoveDenylist(cmd *CMD) error {
 	if err != nil {
 		return &PermanentApplyError{Err: err}
 	}
+	if managed, err := s.wdb.SubscriberBusinessManaged(channelId, channelType); err != nil || managed {
+		return err
+	}
+
 	return s.wdb.RemoveDenylist(channelId, channelType, subscribers)
 }
 
@@ -498,6 +555,10 @@ func (s *Store) handleRemoveAllDenylist(cmd *CMD) error {
 	if err != nil {
 		return &PermanentApplyError{Err: err}
 	}
+	if managed, err := s.wdb.SubscriberBusinessManaged(channelId, channelType); err != nil || managed {
+		return err
+	}
+
 	return s.wdb.RemoveAllDenylist(channelId, channelType)
 }
 

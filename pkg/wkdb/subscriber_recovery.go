@@ -39,6 +39,15 @@ const SubscriberReceiptRetention = 7 * 24 * time.Hour
 // SubscriberOperation is an immutable request. IDs and timestamps are selected
 // before replication; retries reuse OperationID, not a newly generated intent.
 type SubscriberOperation struct {
+	// BusinessRevision orders authoritative snapshots independently of arrival
+	// order. It is only valid on the separately gated reconcile command.
+	BusinessRevision       uint64       `json:"business_revision,omitempty"`
+	SnapshotID             string       `json:"snapshot_id,omitempty"`
+	PageIndex              uint32       `json:"page_index,omitempty"`
+	PageCount              uint32       `json:"page_count,omitempty"`
+	RangeStart             string       `json:"range_start,omitempty"`
+	RangeEnd               string       `json:"range_end,omitempty"`
+	DenyUIDs               []string     `json:"deny_uids,omitempty"`
 	RestoreConversationIDs []uint64     `json:"restore_conversation_ids,omitempty"`
 	OperationID            string       `json:"operation_id"`
 	ChannelID              string       `json:"channel_id"`
@@ -54,11 +63,26 @@ type SubscriberOperation struct {
 }
 
 func (o SubscriberOperation) Validate() error {
+	if err := o.validateSnapshotPage(); err != nil {
+		return err
+	}
 	if o.OperationID == "" || len(o.OperationID) > 128 || o.ChannelID == "" || len(o.ChannelID) > 1024 || o.ChannelType == 0 || o.CreatedAt <= 0 || o.MaxPending == 0 || len(o.UIDs) > MaxSubscriberOperationMembers {
 		return errors.New("invalid subscriber operation")
 	}
 	switch o.Mode {
 	case "add", "remove", "reset", "remove_all", "disband", "deny_add", "deny_set", "deny_remove", "deny_remove_all":
+		if o.BusinessRevision != 0 || len(o.DenyUIDs) != 0 {
+			return errors.New("snapshot fields require reconcile mode")
+		}
+	case "reconcile":
+		if o.BusinessRevision == 0 || len(o.DenyUIDs) > MaxSubscriberOperationMembers {
+			return errors.New("invalid subscriber snapshot")
+		}
+		for i, uid := range o.DenyUIDs {
+			if strings.TrimSpace(uid) == "" || len(uid) > 1024 || (i > 0 && o.DenyUIDs[i-1] >= uid) {
+				return errors.New("snapshot denylist must be canonical")
+			}
+		}
 	default:
 		return errors.New("invalid subscriber operation mode")
 	}
@@ -188,6 +212,7 @@ type SubscriberRecoveryDB interface {
 	ApplySubscriberOperation(uint32, uint64, SubscriberOperation) error
 	ApplySubscriberRecoveryCommands([]SubscriberRecoveryCommand) error
 	GetSubscriberReceipt(string, uint8, string) (SubscriberReceipt, bool, error)
+	SubscriberBusinessManaged(string, uint8) (bool, error)
 	GetSubscriberWork(string, uint8, uint32, uint64) (SubscriberWork, bool, error)
 	GetSubscriberWorkPage(SubscriberWork, int) ([]ConversationEffect, error)
 	GetSubscriberIntent(string, uint8, string) (ConversationEffect, bool, error)
@@ -434,11 +459,16 @@ func (wk *wukongDB) applySubscriberOperation(slot uint32, version uint64, o Subs
 		}
 		return finish()
 	}
+	if reason, err := wk.checkSubscriberRevision(db, o); err != nil {
+		return err
+	} else if reason != "" {
+		return reject(reason)
+	}
 	current, e := wk.recoveryChannel(o.ChannelID, o.ChannelType)
 	if e != nil {
 		return e
 	}
-	if IsEmptyChannelInfo(current) && o.Channel == nil && o.Mode != "add" && o.Mode != "reset" {
+	if IsEmptyChannelInfo(current) && o.Channel == nil && o.Mode != "add" && o.Mode != "reset" && o.Mode != "reconcile" {
 		// Cleanup of a missing channel was a successful no-op before recovery.
 		// Persist that outcome too, so a lost reply cannot later mutate a newly
 		// created channel when the client retries the same operation ID.
@@ -456,16 +486,21 @@ func (wk *wukongDB) applySubscriberOperation(slot uint32, version uint64, o Subs
 		adds = o.UIDs
 	case "remove":
 		removes = o.UIDs
-	case "reset", "remove_all":
+	case "reset", "remove_all", "reconcile":
 		members, e := wk.recoverySubscribers(o.ChannelID, o.ChannelType)
 		if e != nil {
 			return e
 		}
 		for _, m := range members {
-			removes = append(removes, m.Uid)
+			if o.Mode != "reconcile" || o.snapshotContains(m.Uid) {
+				removes = append(removes, m.Uid)
+			}
 		}
-		if o.Mode == "reset" {
+		if o.Mode == "reset" || o.Mode == "reconcile" {
 			adds = o.UIDs
+		}
+		if o.Mode == "reconcile" {
+			removes = append(removes, o.DenyUIDs...)
 		}
 	case "deny_add", "deny_set":
 		removes = o.UIDs
@@ -475,8 +510,20 @@ func (wk *wukongDB) applySubscriberOperation(slot uint32, version uint64, o Subs
 	for i, uid := range o.UIDs {
 		addSet[uid] = o.ConversationIDs[i]
 	}
-	if o.Mode != "add" && o.Mode != "reset" {
+	if o.Mode != "add" && o.Mode != "reset" && o.Mode != "reconcile" {
 		clear(addSet)
+	}
+	// Muted users stay subscribed but have the same conversation tombstone as
+	// deny_set. Membership and conversation eligibility are distinct here.
+	var snapshotMembers map[string]bool
+	if o.Mode == "reconcile" {
+		snapshotMembers = make(map[string]bool, len(o.UIDs))
+		for _, uid := range o.UIDs {
+			snapshotMembers[uid] = true
+		}
+		for _, uid := range o.DenyUIDs {
+			delete(addSet, uid)
+		}
 	}
 	// Unblocking a still-subscribed member creates a fresh lifecycle. Otherwise
 	// a denylist tombstone would suppress that member's future cache flushes forever.
@@ -547,15 +594,6 @@ func (wk *wukongDB) applySubscriberOperation(slot uint32, version uint64, o Subs
 	if _, e := recoveryRead(db, recoverySlotKey(recoveryCounter, slot), &pending); e != nil {
 		return e
 	}
-	weight := uint64(len(uids) + 1) // also charge operations with only tag work
-	if o.ChannelType == wkproto.ChannelTypeLive {
-		weight = 1
-	}
-	// An otherwise idle partition admits one oversized operation. Its durable
-	// tail applies backpressure until drained; maxPending is not a group-size limit.
-	if pending > 0 && (pending >= o.MaxPending || weight > o.MaxPending-pending) {
-		return reject("backlog_full")
-	}
 	work := SubscriberWork{SlotID: slot, Operation: o, Version: version}
 	at := time.Unix(0, o.CreatedAt)
 	staged := &Batch{}
@@ -570,19 +608,38 @@ func (wk *wukongDB) applySubscriberOperation(slot uint32, version uint64, o Subs
 		if e != nil {
 			return e
 		}
-		if !ok || intent.Deleted != deleted {
+		unchanged := ok && intent.Deleted == deleted
+		if !unchanged {
 			intent = ConversationEffect{PreserveExisting: !ok && !deleted && len(members) > 0, UID: uid, ChannelID: o.ChannelID, ChannelType: o.ChannelType, Version: version, ConversationID: addSet[uid], Deleted: deleted, ReadToMsgSeq: o.ReadToMsgSeq, CreatedAt: o.CreatedAt}
 		}
-		if e := recoverySet(batch, recoveryChannelKey(recoveryIntent, o.ChannelID, o.ChannelType, uid), intent); e != nil {
-			return e
+		if o.Mode != "reconcile" || !unchanged {
+			if e := recoverySet(batch, recoveryChannelKey(recoveryIntent, o.ChannelID, o.ChannelType, uid), intent); e != nil {
+				return e
+			}
 		}
-		if o.ChannelType != wkproto.ChannelTypeLive {
+		needTarget := true
+		if o.Mode == "reconcile" && unchanged {
+			// An intent is created atomically with its original source work.
+			// That work is removed only after all targets and tags complete.
+			// Do not fan out an entire group again for a one-member change, but
+			// never mistake an unchanged yet pending intent for completed work.
+			_, pending, err := wk.GetSubscriberWork(o.ChannelID, o.ChannelType, slot, intent.Version)
+			if err != nil {
+				return err
+			}
+			needTarget = pending
+		}
+		if o.ChannelType != wkproto.ChannelTypeLive && needTarget {
 			work.Effects = append(work.Effects, intent)
 		} // live channels do not have recent conversations
 		if o.Mode == "deny_add" || o.Mode == "deny_set" || o.Mode == "deny_remove" || o.Mode == "deny_remove_all" {
 			continue
 		}
-		if deleted {
+		removeMembership := deleted
+		if o.Mode == "reconcile" {
+			removeMembership = !snapshotMembers[uid]
+		}
+		if removeMembership {
 			for _, m := range members {
 				if e := wk.removeSubscriber(o.ChannelID, o.ChannelType, m, staged); e != nil {
 					return e
@@ -597,6 +654,14 @@ func (wk *wukongDB) applySubscriberOperation(slot uint32, version uint64, o Subs
 			}
 		}
 	}
+	// Charge exactly the work which will persist, including tag-only work.
+	// A snapshot's already-completed members do not consume target backlog.
+	weight := uint64(len(work.Effects) + 1)
+	// An idle partition still admits one oversized operation. Its durable tail
+	// applies backpressure until drained; maxPending is not a group-size limit.
+	if pending > 0 && (pending >= o.MaxPending || weight > o.MaxPending-pending) {
+		return reject("backlog_full")
+	}
 	if e := stageRecoveryBatch(db, batch, staged); e != nil {
 		return e
 	}
@@ -605,13 +670,28 @@ func (wk *wukongDB) applySubscriberOperation(slot uint32, version uint64, o Subs
 			return e
 		}
 	}
+	if o.Mode == "reconcile" {
+		if err := wk.stageSnapshotDenylist(batch, o, at); err != nil {
+			return err
+		}
+		if err := wk.stageSubscriberRevision(db, batch, o); err != nil {
+			return err
+		}
+	}
 	if o.Channel != nil || IsEmptyChannelInfo(current) || o.Mode == "disband" {
 		info := current
 		if IsEmptyChannelInfo(info) {
 			info = ChannelInfo{ChannelId: o.ChannelID, ChannelType: o.ChannelType, CreatedAt: &at, UpdatedAt: &at}
 		}
 		if o.Channel != nil {
-			info = *o.Channel
+			if o.Mode == "reconcile" {
+				// Business snapshots own only these flags. Preserve unrelated
+				// metadata such as webhook and message bookkeeping.
+				info.Ban, info.Large, info.Disband = o.Channel.Ban, o.Channel.Large, o.Channel.Disband
+				info.UpdatedAt = &at
+			} else {
+				info = *o.Channel
+			}
 		}
 		if o.Mode == "disband" {
 			info.Disband = true

@@ -54,3 +54,40 @@ func TestSubscriberCapabilityJoinEncodingPreservesLegacyPrefix(t *testing.T) {
 	require.NoError(t, legacy.Unmarshal(b[:len(b)-4]))
 	require.Zero(t, legacy.SubscriberProtocol)
 }
+
+func TestSubscriberRevisionNeedsDistinctProofFromProtocolThree(t *testing.T) {
+	nodes := []*types.Node{{Id: 1, SubscriberProtocol: 3}, {Id: 2, SubscriberProtocol: 3}}
+	require.True(t, subscriberNodesConfirmed(nodes), "ordinary recovery remains available while upgrading")
+	require.False(t, subscriberNodesConfirmedAt(nodes, subscriberRevisionProtocolVersion))
+	called := false
+	proof, err := probeSubscriberNodesAt(context.Background(), nodes, 1, subscriberRevisionProtocolVersion, func(_ context.Context, id uint64) (bool, error) {
+		called = true
+		require.EqualValues(t, 2, id)
+		return false, nil // protocol-3 server has no revision capability endpoint
+	})
+	require.True(t, called)
+	require.Error(t, err)
+	require.Len(t, proof, 1)
+	require.False(t, subscriberProofMatchesAt(nodes, nodes, subscriberRevisionProtocolVersion))
+	proof, err = probeSubscriberNodesAt(context.Background(), nodes, 1, subscriberRevisionProtocolVersion, func(context.Context, uint64) (bool, error) { return true, nil })
+	require.NoError(t, err)
+	require.True(t, subscriberProofMatchesAt(nodes, proof, subscriberRevisionProtocolVersion))
+	proof[1].Online = false
+	_, err = probeSubscriberNodesAt(context.Background(), proof, 1, subscriberRevisionProtocolVersion, func(context.Context, uint64) (bool, error) {
+		t.Fatal("replicated revision capability should survive peer unavailability")
+		return false, nil
+	})
+	require.NoError(t, err)
+	nodes[1].CreatedAt++
+	require.False(t, subscriberProofMatchesAt(nodes, proof, subscriberRevisionProtocolVersion), "replacement node needs a new proof")
+}
+
+func TestSubscriberJoinDoesNotConfusePartialCapabilityWithActivation(t *testing.T) {
+	nodes := []*types.Node{{Id: 1, SubscriberProtocol: 4}, {Id: 2, SubscriberProtocol: 3}}
+	require.EqualValues(t, 3, requiredSubscriberJoinProtocol(nodes))
+	nodes[1].SubscriberProtocol = 4
+	require.EqualValues(t, 4, requiredSubscriberJoinProtocol(nodes))
+	// Online status does not erase a committed protocol proof.
+	nodes[1].Online = false
+	require.EqualValues(t, 4, requiredSubscriberJoinProtocol(nodes))
+}

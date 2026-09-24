@@ -35,3 +35,27 @@ func TestSubscriberProtocolPersistsInConfigAndFencesReplacement(t *testing.T) {
 	require.NoError(t, s.handleCmd(NewCMD(CMDTypeSubscriberProtocols, data)))
 	require.Zero(t, s.SubscriberNodes()[1].SubscriberProtocol, "delayed old-identity proof must not authorize replacement")
 }
+
+func TestSubscriberRevisionProofFencesAlreadyProposedOldJoin(t *testing.T) {
+	c := NewConfig(NewOptions(WithConfigPath(filepath.Join(t.TempDir(), "cluster.json"))))
+	defer c.cfgFile.Close()
+	c.update(&types.Config{Nodes: []*types.Node{
+		{Id: 1, ClusterAddr: "one", CreatedAt: 10, SubscriberProtocol: 4},
+		{Id: 2, ClusterAddr: "two", CreatedAt: 10, SubscriberProtocol: 4},
+	}})
+	s := &Server{config: c}
+	for _, id := range []uint64{2, 3} {
+		oldJoin := &types.Node{Id: id, ClusterAddr: "old-replacement", CreatedAt: 20, SubscriberProtocol: 3}
+		data, err := oldJoin.Marshal()
+		require.NoError(t, err)
+		require.NoError(t, s.handleNodeJoin(NewCMD(CMDTypeNodeJoin, data)))
+		require.Len(t, s.SubscriberNodes(), 2)
+		require.EqualValues(t, 4, s.SubscriberNodes()[1].SubscriberProtocol)
+		require.Equal(t, "two", s.SubscriberNodes()[1].ClusterAddr)
+		require.Empty(t, c.cfg.Learners)
+	}
+	require.True(t, s.subscriberRevisionJoinAllowed(4))
+	// Partial capability confirmation still permits protocol-3 rolling joins.
+	c.update(&types.Config{Nodes: []*types.Node{{Id: 1, SubscriberProtocol: 4}, {Id: 2, SubscriberProtocol: 3}}})
+	require.True(t, s.subscriberRevisionJoinAllowed(3))
+}

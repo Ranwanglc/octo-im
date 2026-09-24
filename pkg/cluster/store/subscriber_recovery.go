@@ -22,11 +22,10 @@ var ErrSubscriberConflict = errors.New("operation_id already used for different 
 // Recovery is maintenance traffic and must not saturate slot apply behind HTTP
 // requests when several large membership changes arrive together.
 const (
-	subscriberRecoveryInlinePageSize        = 1024
-	subscriberRecoveryInlineParallelism     = 8
-	subscriberRecoveryTargetProposalLimit   = 16
-	subscriberRecoveryForegroundLimit       = 14
-	subscriberRecoveryMinimumProposalBudget = 2 * time.Second
+	subscriberRecoveryInlinePageSize      = 1024
+	subscriberRecoveryInlineParallelism   = 8
+	subscriberRecoveryTargetProposalLimit = 16
+	subscriberRecoveryForegroundLimit     = 14
 )
 
 type SubscriberRecoveryConfig struct {
@@ -164,6 +163,7 @@ func (s *Store) ExistingSubscriberOperation(o wkdb.SubscriberOperation) (wkdb.Su
 		return r, found, err
 	}
 	o.UIDs = canonicalSubscriberUIDs(o.UIDs)
+	o.DenyUIDs = canonicalSubscriberUIDs(o.DenyUIDs)
 	if r.Digest != o.Digest() {
 		return r, false, ErrSubscriberConflict
 	}
@@ -178,6 +178,7 @@ func (s *Store) SubmitSubscriberOperation(ctx context.Context, o wkdb.Subscriber
 		return wkdb.SubscriberReceipt{}, fmt.Errorf("%w: too many subscribers", ErrInvalidSubscriberOperation)
 	}
 	o.UIDs = canonicalSubscriberUIDs(o.UIDs)
+	o.DenyUIDs = canonicalSubscriberUIDs(o.DenyUIDs)
 	if o.OperationID == "" {
 		o.OperationID = wkutil.GenUUID()
 	}
@@ -236,7 +237,11 @@ func (s *Store) SubmitSubscriberOperation(ctx context.Context, o wkdb.Subscriber
 			return old, nil
 		}
 	}
-	if err := s.proposeRecovery(ctx, slot, CMDSubscriberOperation, o); err != nil {
+	command := CMDSubscriberOperation
+	if o.Mode == "reconcile" {
+		command = CMDSubscriberReconcile
+	}
+	if err := s.proposeRecovery(ctx, slot, command, o); err != nil {
 		return wkdb.SubscriberReceipt{OperationID: o.OperationID, ChannelID: o.ChannelID, ChannelType: o.ChannelType, State: "unknown"}, err
 	}
 	r, found, err := s.wdb.GetSubscriberReceipt(o.ChannelID, o.ChannelType, o.OperationID)
@@ -376,8 +381,8 @@ func (s *Store) proposeRecovery(ctx context.Context, slot uint32, tp CMDType, v 
 
 // proposeConversationEffects limits only recovery fan-out. Source operation
 // and checkpoint commands remain unthrottled so progress can always be
-// recorded. A small deadline reserve prevents a request which spent its budget
-// waiting for admission from appending work that it can no longer await.
+// recorded. Use the actual remaining request deadline: a fixed two-second
+// reserve rejected healthy targets before the HTTP timeout had elapsed.
 func (s *Store) proposeConversationEffects(ctx context.Context, slot uint32, effects []wkdb.ConversationEffect, foreground bool) error {
 	r := s.recovery
 	r.mu.Lock()
@@ -411,10 +416,8 @@ func (s *Store) proposeConversationEffects(ctx context.Context, slot uint32, eff
 	}
 	defer func() { <-r.targetTokens }()
 	finishWaiting()
-	if foreground {
-		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < subscriberRecoveryMinimumProposalBudget {
-			return context.DeadlineExceeded
-		}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	r.mu.Lock()
 	r.stats.TargetInflight++
@@ -470,7 +473,7 @@ func (s *Store) applySubscriberRecoveryCommands(slot uint32, cmds []*CMD, versio
 			return &PermanentApplyError{Err: errors.New("recovery command too large")}
 		}
 		switch cmd.CmdType {
-		case CMDSubscriberOperation:
+		case CMDSubscriberOperation, CMDSubscriberReconcile:
 			var operation wkdb.SubscriberOperation
 			if err := json.Unmarshal(cmd.Data, &operation); err != nil {
 				return &PermanentApplyError{Err: err}
@@ -480,6 +483,9 @@ func (s *Store) applySubscriberRecoveryCommands(slot uint32, cmds []*CMD, versio
 			}
 			if err := operation.Validate(); err != nil {
 				return &PermanentApplyError{Err: err}
+			}
+			if (cmd.CmdType == CMDSubscriberReconcile) != (operation.Mode == "reconcile") {
+				return &PermanentApplyError{Err: errors.New("snapshot requires subscriber protocol 4 command")}
 			}
 			commands = append(commands, wkdb.SubscriberRecoveryCommand{SlotID: slot, Version: versions[i], Operation: &operation})
 		case CMDSubscriberCheckpoint:

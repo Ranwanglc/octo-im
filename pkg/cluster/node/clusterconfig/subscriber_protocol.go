@@ -62,3 +62,23 @@ func (c *Config) confirmSubscriberProtocols(confirmed []*types.Node) {
 		}
 	}
 }
+
+// subscriberRevisionJoinAllowed is checked during config Apply, not only at
+// RPC admission. A join proposed before protocol-4 activation may commit after
+// its proof; accepting that stale proposal would invalidate the emitted log
+// format while allowing an older binary to become a replica.
+func (s *Server) subscriberRevisionJoinAllowed(protocol uint32) bool {
+	if protocol >= 4 {
+		return true
+	}
+	nodes := s.SubscriberNodes()
+	if len(nodes) == 0 {
+		return true
+	}
+	for _, node := range nodes {
+		if node.SubscriberProtocol < 4 {
+			return true
+		}
+	}
+	return false
+}

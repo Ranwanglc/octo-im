@@ -130,6 +130,11 @@ func (s *Server) handleNodeJoin(cmd *CMD) error {
 		s.Error("unmarshal node err", zap.Error(err))
 		return err
 	}
+	if !s.subscriberRevisionJoinAllowed(newNode.SubscriberProtocol) {
+		// Deterministic no-op: rejecting an already-committed command with
+		// a retryable Apply error would stop configuration progress forever.
+		return nil
+	}
 	s.config.addOrUpdateNode(newNode)
 
 	// 将新节点加入学习者列表

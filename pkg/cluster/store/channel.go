@@ -1,6 +1,10 @@
 package store
 
-import "github.com/WuKongIM/WuKongIM/pkg/wkdb"
+import (
+	"fmt"
+
+	"github.com/WuKongIM/WuKongIM/pkg/wkdb"
+)
 
 // AddSubscribers 添加订阅者
 func (s *Store) AddSubscribers(channelId string, channelType uint8, subscribers []wkdb.Member) error {
@@ -69,6 +73,11 @@ func (s *Store) GetSubscribers(channelID string, channelType uint8) ([]wkdb.Memb
 
 // AddOrUpdateChannel add or update channel
 func (s *Store) AddChannelInfo(channelInfo wkdb.ChannelInfo) error {
+	if managed, err := s.wdb.SubscriberBusinessManaged(channelInfo.ChannelId, channelInfo.ChannelType); err != nil {
+		return err
+	} else if managed {
+		return fmt.Errorf("managed channel metadata requires a business revision")
+	}
 	data, err := EncodeChannelInfo(channelInfo, CmdVersionChannelInfo)
 	if err != nil {
 		return err
@@ -84,6 +93,11 @@ func (s *Store) AddChannelInfo(channelInfo wkdb.ChannelInfo) error {
 }
 
 func (s *Store) UpdateChannelInfo(channelInfo wkdb.ChannelInfo) error {
+	if managed, err := s.wdb.SubscriberBusinessManaged(channelInfo.ChannelId, channelInfo.ChannelType); err != nil {
+		return err
+	} else if managed {
+		return fmt.Errorf("managed channel metadata requires a business revision")
+	}
 	data, err := EncodeChannelInfo(channelInfo, CmdVersionChannelInfo)
 	if err != nil {
 		return err
